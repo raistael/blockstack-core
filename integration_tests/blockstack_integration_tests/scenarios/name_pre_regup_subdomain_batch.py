@@ -49,7 +49,6 @@ wallets = [
 consensus = "17ac43c1d8549c3181b200f1bf97eb7d"
 
 def scenario( wallets, **kw ):
-    
     zonefile_batches = []
 
     testlib.blockstack_namespace_preorder( "test", wallets[1].addr, wallets[0].privkey )
@@ -107,10 +106,9 @@ def scenario( wallets, **kw ):
     testlib.next_block(**kw)
     
     # query each subdomain
-    proxy = testlib.make_proxy()
     for i in xrange(1, 4):
         fqn = 'bar.foo{}.test'.format(i)
-        res = client.get_name_record(fqn, proxy=proxy)
+        res = client.get_name_record(fqn, hostport='http://localhost:16264')
         if 'error' in res:
             print res
             return False
@@ -160,8 +158,8 @@ def check( state_engine ):
         if preorder is not None:
             print 'still have preorder: {}'.format(preorder)
             return False
-         
-        # registered 
+
+        # registered
         name_rec = state_engine.get_name(name)
         if name_rec is None:
             print 'did not get name {}'.format(name)
@@ -171,5 +169,33 @@ def check( state_engine ):
         if name_rec['address'] != wallets[3].addr or name_rec['sender'] != virtualchain.make_payment_script(wallets[3].addr):
             print 'wrong address for {}: {}'.format(name, name_rec)
             return False
+
+
+    res = testlib.blockstack_REST_call("GET", "/v1/subdomains?page=0",
+                                       api_pass='blockstack_integration_test_api_password')
+    if 'error' in res or res['http_status'] != 200:
+        res['test'] = 'Failed to get name bar.test'
+        print json.dumps(res)
+        return False
+
+    names = res['response']
+    found_names = [ x for x in ['bar.foo1.test','bar.foo2.test','bar.foo3.test']
+                    if x in names ]
+    if len(found_names) != 3:
+        print names
+        return False
+
+    print names
+    res = testlib.blockstack_REST_call("GET", "/v1/blockchains/bitcoin/subdomains_count",
+                                       api_pass='blockstack_integration_test_api_password')
+    if 'error' in res or res['http_status'] != 200:
+        res['test'] = 'Failed to get name bar.test'
+        print json.dumps(res)
+        return False
+
+    names_count = res['response']['names_count']
+    if names_count != 3:
+        print names
+        return False
 
     return True

@@ -31,6 +31,8 @@ import sys
 import copy
 import time
 import random
+import hashlib
+import jsonschema
 
 # hack around absolute paths
 curr_dir = os.path.abspath( os.path.join( os.path.dirname(__file__), ".." ) )
@@ -50,13 +52,16 @@ log = virtualchain.get_logger("blockstack-server")
 BLOCKSTACK_DB_SCRIPT = ""
 
 BLOCKSTACK_DB_SCRIPT += """
+-- Blockchain history table---stores points in time at which every *on-chain* operation occurs.
+-- Does NOT store account operations that get executed as part of name operations or vesting periods---that's in the accounts table.
+-- However, this will include on-chain token transfer transactions.
 -- NOTE: history_id is a fully-qualified name or namespace ID.
--- NOTE: creator_address is the address that owned the name or namespace ID at the time of insertion
+-- NOTE: creator_address is the address that owned the name or namespace ID at the time of insertion.
 -- NOTE: value_hash is the associated value hash for this history entry at the time of insertion.
 -- NOTE: history_data is a JSON blob with the operation that was committed at this point in time.
 CREATE TABLE history( txid TEXT NOT NULL,
-                      history_id STRING,
-                      creator_address STRING,
+                      history_id TEXT,
+                      creator_address TEXT,
                       block_id INT NOT NULL,
                       vtxindex INT NOT NULL,
                       op TEXT NOT NULL,
@@ -82,10 +87,12 @@ CREATE TABLE preorders( preorder_hash TEXT NOT NULL,
                         address TEXT,
                         block_number INT NOT NULL,
                         op TEXT NOT NULL,
-                        op_fee INT NOT NULL,
+                        op_fee INT NOT NULL,        -- units in satoshis
                         txid TEXT NOT NULL,
                         vtxindex INT,
                         burn_address TEXT NOT NULL,
+                        token_fee TEXT NOT NULL,     -- use TEXT so we don't overflow (unit value)
+                        token_units TEXT NOT NULL,   -- is either STACKS, or it matches a namespace ID
 
                         -- primary key includes the block number and txid, so an expired preorder can be overwritten
                         PRIMARY KEY(preorder_hash,block_number,txid));
@@ -94,7 +101,7 @@ CREATE TABLE preorders( preorder_hash TEXT NOT NULL,
 BLOCKSTACK_DB_SCRIPT += """
 -- NOTE: this table includes revealed namespaces
 -- NOTE: 'buckets' is a string representation of an array of 16 integers.
-CREATE TABLE namespaces( namespace_id STRING NOT NULL,
+CREATE TABLE namespaces( namespace_id TEXT NOT NULL,
                          preorder_hash TEXT NOT NULL,
                          version INT,
                          sender TEXT NOT NULL,
@@ -105,7 +112,7 @@ CREATE TABLE namespaces( namespace_id STRING NOT NULL,
                          block_number INT NOT NULL,
                          reveal_block INT NOT NULL,
                          op TEXT NOT NULL,
-                         op_fee INT NOT NULL,
+                         op_fee INT NOT NULL,           -- units in satoshis
                          txid TEXT NOT NULL NOT NULL,
                          vtxindex INT NOT NULL,
                          lifetime INT NOT NULL,
@@ -116,16 +123,18 @@ CREATE TABLE namespaces( namespace_id STRING NOT NULL,
                          no_vowel_discount INT NOT NULL,
                          ready_block INT NOT NULL,
 
+                         token_fee TEXT NOT NULL,       -- use TEXT so we don't overflow (unit value)
+
                          -- primary key includes block number, so an expired revealed namespace can be re-revealed
                          PRIMARY KEY(namespace_id,block_number)
                          );
 """
 
 BLOCKSTACK_DB_SCRIPT += """
-CREATE TABLE name_records( name STRING NOT NULL,
+CREATE TABLE name_records( name TEXT NOT NULL,
                            preorder_hash TEXT NOT NULL,
                            name_hash128 TEXT NOT NULL,
-                           namespace_id STRING NOT NULL,
+                           namespace_id TEXT NOT NULL,
                            namespace_block_number INT NOT NULL,
                            value_hash TEXT,
                            sender TEXT NOT NULL,
@@ -139,13 +148,14 @@ CREATE TABLE name_records( name STRING NOT NULL,
                            op TEXT NOT NULL,
                            txid TEXT NOT NULL,
                            vtxindex INT NOT NULL,
-                           op_fee INT NOT NULL,
+                           op_fee INT NOT NULL,         -- units in satoshis
                            importer TEXT,
                            importer_address TEXT,
                            consensus_hash TEXT,
+                           token_fee TEXT NOT NULL,     -- use TEXT so we don't overflow (unit value)
 
                            -- for compatibility with previous versions' quirks
-                           last_creation_op STRING NOT NULL,
+                           last_creation_op TEXT NOT NULL,
 
                            -- primary key includes block number, so an expired name can be re-registered 
                            PRIMARY KEY(name,block_number),
@@ -155,15 +165,59 @@ CREATE TABLE name_records( name STRING NOT NULL,
                            );
 """
 
-'''
-BLOCKSTACK_DB_SCRIPT += """
-CREATE TABLE ops_hashes( block_id INTEGER PRIMARY KEY NOT NULL,
-                         ops_hash STRING NOT NULL );
+# chain tip of all account transactions (by address and type).  Stores the history of all account operations.
+# rows get inserted under the following rules:
+# * if the user buys a name or namespace (or transfers in Phase 2+), a row is inserted that *debits* the account (by increasing the debit_value)
+# * if the user receives tokens through vesting, or through a transfer (phase 2+), or pay-to-namespace payment (phase 2+), a row is inserted that *credits* the account (by increasing the credit_value)
+BLOCKSTACK_DB_ACCOUNTS_TABLE_SCRIPT = """
+CREATE TABLE accounts( address TEXT NOT NULL,
+                       type TEXT NOT NULL,           -- what kind of token? STACKs, etc.
+
+                       credit_value TEXT NOT NULL,   -- always increases, encoded as a TEXT to avoid overflow (unit value)
+                       debit_value TEXT NOT NULL,    -- always increases, encoded as a TEXT to avoid overflow (unit value)
+
+                       lock_transfer_block_id INTEGER NOT NULL,     -- point in time where it becomes possible for this account to send tokens
+                       receive_whitelisted INTEGER NOT NULL,        -- for now, only certain accounts can receive tokens (this will be 1 if this is true for this account)
+
+                       metadata TEXT,   -- user-programmable field (e.g. stores hash of legal contract that owns the address)
+
+                       -- where in the blockchain this occurred
+                       -- NOTE: account operations may be inserted as a result of processing another operation (like buying a name).
+                       -- if so, then this information will point to the history snapshot of that operation.
+                       -- built-in operations (like token vesting) will 'occur' at vtxindex = 0 (i.e. as part of the block's "coinbase")
+                       block_id INTEGER NOT NULL,
+                       txid TEXT NOT NULL,
+                       vtxindex INTEGER NOT NULL,
+
+                       PRIMARY KEY(address,block_id,txid,vtxindex,type) );
 """
-'''
+BLOCKSTACK_DB_SCRIPT += BLOCKSTACK_DB_ACCOUNTS_TABLE_SCRIPT
+
+BLOCKSTACK_DB_ADDRESS_ACCOUNTS_INDEX_SCRIPT = """
+CREATE INDEX address_accounts ON accounts(address, type);
+"""
+BLOCKSTACK_DB_SCRIPT += BLOCKSTACK_DB_ADDRESS_ACCOUNTS_INDEX_SCRIPT
+
+# extra time-locked credits to an account.
+# vesting_value will always be positive.
+# when the system reaches a block that vests, a "credit" operation will be generated and inserted into the accounts table to reflect it.
+BLOCKSTACK_DB_ACCOUNT_VESTING_TABLE_SCRIPT = """
+CREATE TABLE account_vesting( address TEXT NOT NULL,            -- account address
+                              type TEXT NOT NULL,               -- type of token (e.g. STACKS, GENESIS)
+                              vesting_value TEXT NOT NULL,      -- value to vest, encoded as a TEXT to avoid overflow (unit value, e.g. microSTACKs)
+                              block_id INTEGER NOT NULL,        -- block at which these tokens are credited
+
+                              PRIMARY KEY(address,type,block_id)
+                              );
+"""
+BLOCKSTACK_DB_SCRIPT += BLOCKSTACK_DB_ACCOUNT_VESTING_TABLE_SCRIPT
 
 BLOCKSTACK_DB_SCRIPT += """
 CREATE INDEX hash_names_index ON name_records( name_hash128, name );
+"""
+
+BLOCKSTACK_DB_SCRIPT += """
+CREATE INDEX address_names_index ON name_records( address, name );
 """
 
 BLOCKSTACK_DB_SCRIPT += """
@@ -171,12 +225,191 @@ CREATE INDEX value_hash_names_index on name_records( value_hash, name );
 """
 
 BLOCKSTACK_DB_SCRIPT += """
+CREATE INDEX addr_names_index ON name_records( address, name );
+"""
+
+BLOCKSTACK_DB_SCRIPT += """
 -- turn on foreign key constraints 
 PRAGMA foreign_keys = ON;
 """
 
+BLOCKSTACK_DB_SCRIPT += """
+CREATE TABLE db_version( version TEXT NOT NULL );
+INSERT INTO db_version VALUES ("{}");
+""".format(VERSION)
 
-def namedb_create( path ):
+def namedb_genesis_txid(address, metadata):
+    """
+    Make a "fake" txid for a genesis block entry.
+    Returns a 32-byte hash (double-sha256), hex-encoded
+    """
+    preimage = '{} genesis {}'.format(address, metadata)
+    return virtualchain.lib.hashing.bin_double_sha256(preimage).encode('hex')
+
+
+def namedb_vesting_txid(address, token_type, token_amount, block_height):
+    """
+    Make a "fake" txid for a vesting transaction.
+    Returns a 32-byte hash (double-sha256), hex-encoded
+    """
+    preimage = '{} vesting {} {} at {}'.format(address, token_type, token_amount, block_height)
+    return virtualchain.lib.hashing.bin_double_sha256(preimage).encode('hex')
+
+
+def namedb_genesis_block_history_hash(genesis_block_history):
+    """
+    Make a "fake" txid for the genesis block history
+    Returns a 32-byte hash (single sha256), hex-encoded
+    (single sha256 so it can be easily verified against our genesis block tooling)
+    """
+    # no-whitespace sorted serialization
+    preimage = json.dumps(genesis_block_history, sort_keys=True, separators=(',',':'))
+    h = hashlib.sha256(preimage).hexdigest()
+    return h
+
+
+def namedb_create_token_genesis(con, initial_account_balances, genesis_block_history):
+    """
+    Create the initial account balances.
+    All accounts will be locked, and will have been created at the genesis date
+    for Blockstack (i.e. FIRST_BLOCK_MAINNET)
+
+    The genesis block has multiple "stages" that encode the transfer of tokens from
+    Blockstack Token LLC to the various investors, GPs, etc.  For the initial genesis
+    block for the accredited token sale, there should be four such stages.
+
+    @initial_account_balances is the final genesis block stage that encodes the
+    token allocations and unlock periods for each initial account holder (i.e. the
+    initial investors)
+
+    @genesis_block_history is a sequence of signed hashes over each stage.
+    
+    @initial_count_balances is a list of dicts:
+    [
+        {
+            'address': ...,
+            'type': ...,
+            'value': ...,
+            'vesting': {
+                block_height: value
+            },
+            'vesting_total': ...,
+            'lock_send': ... (optional; block height)
+            'receive_whitelisted': ... (optional; bool)
+            'metadata': ... (optional)
+        },
+        {...}
+    ]
+    @genesis_block_history this structure:
+    [
+        {
+            "hash": ...,
+            "signature": ...
+        },
+    ]
+    We'll store the genesis block history's canonical hash as the first transaction.
+    """
+    namedb_query_execute(con, "BEGIN", ())
+    for account_info in initial_account_balances:
+        # check required fields 
+        for f in ['address', 'type', 'value']:
+            assert f in account_info, 'BUG: missing {} in {}'.format(f, account_info)
+
+        metadata = None
+        address = None
+
+        try:
+            address = account_info['address']
+            if is_c32_address(address):
+                address = address_as_b58(address)
+
+            address = virtualchain.address_reencode(address)
+        except ValueError:
+            assert account_info.get('receive_whitelisted') == False, 'Unspendable address "{}" must be explicitly marked as not receive-whitelisted'.format(account_info['address'])
+
+            log.warning('Using unspendable address "{}"'.format(account_info['address']))
+            address = account_info['address']
+
+        if 'metadata' in account_info and account_info['metadata'] is not None:
+            metadata = account_info['metadata']
+            log.debug('Grant {} to {} (originally: {}, metadata: {})'.format(account_info['value'], address, account_info['address'], metadata))
+
+        else:
+            log.debug('Grant {} to {}'.format(account_info['value'], address))
+            metadata = '' 
+
+        lock_send = account_info.get('lock_send', 0)
+        assert lock_send >= 0, 'Invalid lock_send: {}'.format(lock_send)
+
+        receive_whitelisted = account_info.get('receive_whitelisted', True)     # whitelist by default for now
+
+        # set up initial account balances
+        sql = 'INSERT INTO accounts VALUES (?,?,?,?,?,?,?,?,?,?);'
+
+        fake_txid = namedb_genesis_txid(address, metadata)
+
+        args = (address, account_info['type'], '{}'.format(account_info['value']), '0', lock_send, receive_whitelisted, metadata, FIRST_BLOCK_MAINNET, fake_txid, 0)
+        namedb_query_execute(con, sql, args)
+
+        # set up vesting period
+        if 'vesting' in account_info:
+            assert 'vesting_total' in account_info, 'BUG: vesting is present but vesting_total is not'
+
+            vesting_sum = sum([account_info['vesting'][h] for h in account_info['vesting']]) 
+            assert vesting_sum == account_info['vesting_total'], 'BUG: vesting mismatch on {}: {} != {} ({})'.format(address, vesting_sum, account_info['vesting_total'], account_info['vesting'])
+
+            for block_height in account_info['vesting']:
+                sql = 'INSERT INTO account_vesting VALUES (?,?,?,?);'
+                args = (address, account_info['type'], '{}'.format(account_info['vesting'][block_height]), int(block_height))
+                namedb_query_execute(con, sql, args)
+
+    # insert genesis history 
+    genesis_hash = namedb_genesis_block_history_hash(genesis_block_history)
+    sql = 'INSERT INTO accounts VALUES (?,?,?,?,?,?,?,?,?,?);'
+    args = (BLOCKSTACK_BURN_ADDRESS, 'GENESIS', '0', '0', True, False, genesis_hash, FIRST_BLOCK_MAINNET, genesis_hash, 0)
+    namedb_query_execute(con, sql, args)
+
+    namedb_query_execute(con, "END", ())
+
+
+def namedb_get_version(con):
+    """
+    Get the db version
+    """
+    sql = 'SELECT version FROM db_version;'
+    args = ()
+
+    try:
+        rowdata = namedb_query_execute(con, sql, args, abort=False)
+        row = rowdata.fetchone()
+        return row['version']
+    except:
+        # no version defined
+        return '0.0.0.0'
+
+
+def namedb_read_version(path):
+    """
+    Get the db version
+    """
+    con = sqlite3.connect( path, isolation_level=None, timeout=2**30 )
+    con.row_factory = namedb_row_factory
+
+    sql = 'SELECT version FROM db_version;'
+    args = ()
+
+    try:
+        rowdata = namedb_query_execute(con, sql, args, abort=False)
+        row = rowdata.fetchone()
+        return row['version']
+    except:
+        # no version defined
+        return '0.0.0.0'
+    finally:
+        con.close()
+
+
+def namedb_create(path, genesis_block):
     """
     Create a sqlite3 db at the given path.
     Create all the tables and indexes we need.
@@ -195,22 +428,24 @@ def namedb_create( path ):
 
     con.row_factory = namedb_row_factory
 
-    # add user-defined functions
-    con.create_function("namespace_lifetime_multiplier", 2, namedb_get_namespace_lifetime_multiplier)
-    con.create_function("namespace_lifetime_grace_period", 2, namedb_get_namespace_lifetime_grace_period)
+    # create genesis block
+    namedb_create_token_genesis(con, genesis_block['rows'], genesis_block['history'])
     return con
 
 
 def namedb_open( path ):
     """
-    Open a connection to our database 
+    Open a connection to our database
     """
     con = sqlite3.connect( path, isolation_level=None, timeout=2**30 )
+    db_query_execute(con, 'pragma mmap_size=536870912', ())
     con.row_factory = namedb_row_factory
 
-    # add user-defined functions
-    con.create_function("namespace_lifetime_multiplier", 2, namedb_get_namespace_lifetime_multiplier)
-    con.create_function("namespace_lifetime_grace_period", 2, namedb_get_namespace_lifetime_grace_period)
+    version = namedb_get_version(con)
+    if not semver_equal(version, VERSION):
+        # wrong version
+        raise Exception('Database has version {}, but this node is version {}.  Please update your node database (such as with fast_sync).'.format(version, VERSION))
+
     return con
 
 
@@ -221,7 +456,7 @@ def namedb_row_factory( cursor, row ):
     """
     d = {}
     for idx, col in enumerate( cursor.description ):
-        if col[0] == 'revoked':
+        if col[0] in ['revoked', 'locked', 'receive_whitelisted']:
             if row[idx] == 0:
                 d[col[0]] = False
             elif row[idx] == 1:
@@ -231,46 +466,20 @@ def namedb_row_factory( cursor, row ):
             else:
                 raise Exception("Invalid value for 'revoked': %s" % row[idx])
 
+        elif col[0] in ['credit_value', 'debit_value', 'vesting_value', 'token_fee']:
+            # convert back to int.
+            # this is safe in Python, since Python ints don't overflow
+            try:
+                d[col[0]] = int(row[idx]) if row[idx] is not None else None
+            except ValueError as ve:
+                log.exception(ve)
+                log.fatal("Caught exception while converting '{}' to an int".format(row[idx]))
+                os.abort()
+
         else:
             d[col[0]] = row[idx]
 
     return d
-
-
-def namedb_get_namespace_lifetime_multiplier( block_height, namespace_id ):
-    """
-    User-defined sqlite3 function that gets the namespace
-    lifetime multiplier at a particular block height.
-    """
-    try:
-        namespace_lifetime_multiplier = get_epoch_namespace_lifetime_multiplier( block_height, namespace_id )
-        return namespace_lifetime_multiplier
-    except Exception, e:
-        try:
-            with open("/tmp/blockstack_db_exception.txt", "w") as f:
-                f.write(traceback.format_exc())
-        except:
-            raise
-
-        raise
-
-
-def namedb_get_namespace_lifetime_grace_period( block_height, namespace_id ):
-    """
-    User-defined sqlite3 function that gets the namespace
-    lifetime grace period at a particular block height.
-    """
-    try:
-        namespace_lifetime_grace_period = get_epoch_namespace_lifetime_grace_period( block_height, namespace_id )
-        return namespace_lifetime_grace_period
-    except Exception, e:
-        try:
-            with open("/tmp/blockstack_db_exception.txt", "w") as f:
-                f.write(traceback.format_exc())
-        except:
-            raise
-
-        raise
 
 
 def namedb_find_missing_and_extra(cur, record, table_name):
@@ -488,13 +697,13 @@ def namedb_format_query( query, values ):
     return db_format_query(query, values)
 
 
-def namedb_query_execute( cur, query, values ):
+def namedb_query_execute( cur, query, values, abort=True):
     """
     Execute a query.  If it fails, abort.  Retry with timeouts on lock
 
     DO NOT CALL THIS DIRECTLY.
     """
-    return db_query_execute(cur, query, values)
+    return db_query_execute(cur, query, values, abort=abort)
 
 
 def namedb_preorder_insert( cur, preorder_rec ):
@@ -984,17 +1193,27 @@ def namedb_state_create( cur, opcode, new_record, block_id, vtxindex, txid, hist
         if prev_rec is not None:
             exists = True
     
+    # the record we insert into the history table
+    preorder_record_history = {}
+    preorder_record_history.update(preorder_record)
+
     try:
-        assert 'op' in preorder_record.keys(), 'BUG: no preorder op'
-        assert 'preorder_hash' in preorder_record.keys(), "BUG: no preorder hash"
-        assert 'block_number' in preorder_record.keys(), "BUG: preorder has no block number"
-        assert 'vtxindex' in preorder_record.keys(), "BUG: preorder has no vtxindex"
-        assert 'txid' in preorder_record.keys(), "BUG: preorder has no txid"
-        assert 'burn_address' in preorder_record.keys(), 'BUG: preorder has no burn address'
+        assert 'op' in preorder_record_history.keys(), 'BUG: no preorder op'
+        assert 'preorder_hash' in preorder_record_history.keys(), "BUG: no preorder hash"
+        assert 'block_number' in preorder_record_history.keys(), "BUG: preorder has no block number"
+        assert 'vtxindex' in preorder_record_history.keys(), "BUG: preorder has no vtxindex"
+        assert 'txid' in preorder_record_history.keys(), "BUG: preorder has no txid"
+        assert 'burn_address' in preorder_record_history.keys(), 'BUG: preorder has no burn address'
+        assert 'token_fee' in preorder_record_history.keys(), 'BUG: preorder has no token fee'
+        assert 'op_fee' in preorder_record_history.keys(), 'BUG: preorder has no op fee'
 
         if prev_rec is not None:
             # block_number cannot change
             assert prev_rec['block_number'] == new_record['block_number'], 'BUG: trying to change block number from {} to {} for "{}"'.format(prev_rec['block_number'], new_record['block_number'], history_id)
+
+        # convert token fee to string, always
+        if isinstance(preorder_record_history['token_fee'], (int,long)):
+            preorder_record_history['token_fee'] = '{}'.format(preorder_record_history['token_fee'])
 
     except Exception, e:
         log.exception(e)
@@ -1020,7 +1239,7 @@ def namedb_state_create( cur, opcode, new_record, block_id, vtxindex, txid, hist
         os.abort()
 
     # save the preorder as history.
-    rc = namedb_history_save(cur, preorder_record['opcode'], history_id, None, None, preorder_record['block_number'], preorder_record['vtxindex'], preorder_record['txid'], preorder_record)
+    rc = namedb_history_save(cur, preorder_record['opcode'], history_id, None, None, preorder_record['block_number'], preorder_record['vtxindex'], preorder_record['txid'], preorder_record_history)
     if not rc:
         log.error("FATAL: failed to save preorder for {} at ({}, {})".format(history_id, preorder_record['block_number'], preorder_record['vtxindex']))
         os.abort()
@@ -1198,6 +1417,157 @@ def namedb_state_create_as_import( db, opcode, new_record, block_id, vtxindex, t
     return canonicalized_record
 
 
+def namedb_account_transaction_save(cur, address, token_type, new_credit_value, new_debit_value, block_id, vtxindex, txid, existing_account):
+    """
+    Insert the new state of an account at a particular point in time.
+
+    The data must be for a never-before-seen (txid,block_id,vtxindex) set in the accounts table, but must
+    correspond to an entry in the history table.
+
+    If existing_account is not None, then copy all other remaining fields from it.
+
+    Return True on success
+    Raise an Exception on error
+    """
+    if existing_account is None:
+        existing_account = {}
+
+    accounts_insert = {
+        'address': address,
+        'type': token_type,
+        'credit_value': '{}'.format(new_credit_value),
+        'debit_value': '{}'.format(new_debit_value),
+        'lock_transfer_block_id': existing_account.get('lock_transfer_block_id', 0),        # unlocks immediately if the account doesn't exist
+        'receive_whitelisted': existing_account.get('receive_whitelisted', True),           # new accounts are whitelisted by default (for now)
+        'metadata': existing_account.get('metadata', None),
+        'block_id': block_id,
+        'txid': txid,
+        'vtxindex': vtxindex
+    }
+
+    try:
+        query, values = namedb_insert_prepare(cur, accounts_insert, 'accounts')
+    except Exception as e:
+        log.exception(e)
+        log.fatal('FATAL: failed to append account history record for {} at ({},{})'.format(address, block_id, vtxindex))
+        os.abort()
+    
+    namedb_query_execute(cur, query, values)
+    return True
+
+
+def namedb_account_debit(cur, account_addr, token_type, amount, block_id, vtxindex, txid):
+    """
+    Debit an account at a particular point in time by the given amount.
+    Insert a new history entry for the account into the accounts table.
+
+    The account must exist
+
+    Abort the program if the account balance goes negative, or the count does not exist
+    """
+    account = namedb_get_account(cur, account_addr, token_type)
+    if account is None:
+        traceback.print_stack()
+        log.fatal('Account {} does not exist'.format(account_addr))
+        os.abort()
+
+    new_credit_value = account['credit_value']
+    new_debit_value = account['debit_value'] + amount
+
+    # sanity check
+    if new_debit_value > new_credit_value:
+        traceback.print_stack()
+        log.fatal('Account {} for "{}" tokens overdrew (debits = {}, credits = {})'.format(account_addr, token_type, new_debit_value, new_credit_value))
+        os.abort()
+
+    new_balance = new_credit_value - new_debit_value
+    log.debug("Account balance of units of '{}' for {} is now {}".format(token_type, account_addr, new_balance))
+
+    res = namedb_account_transaction_save(cur, account_addr, token_type, new_credit_value, new_debit_value, block_id, vtxindex, txid, account)
+    if not res:
+        traceback.print_stack()
+        log.fatal('Failed to save new account state for {}'.format(account_addr))
+        os.abort()
+
+    return True
+
+
+def namedb_account_credit(cur, account_addr, token_type, amount, block_id, vtxindex, txid):
+    """
+    Credit an account at a particular point in time by the given amount.
+    Insert a new history entry for the account into the accounts table.
+
+    The account does not need to exist.  If it does not exist, then it will be created.
+
+    Abort the program if anything goes wrong.
+    """
+    account = namedb_get_account(cur, account_addr, token_type)
+    
+    new_credit_value = None
+    new_debit_value = None
+
+    if account is None:
+        # creating new account
+        log.debug("Creating account {} with initial balance of '{}' {} at ({},{})".format(account_addr, token_type, amount, block_id, vtxindex))
+        new_credit_value = amount
+        new_debit_value = 0
+
+    else:
+        # updating an existing account
+        new_credit_value = account['credit_value'] + amount
+        new_debit_value = account['debit_value']
+
+    # sanity check
+    if new_debit_value > new_credit_value:
+        traceback.print_stack()
+        log.fatal("Account {} for units of '{}' tokens overdrew (debits = {}, credits = {})".format(account_addr, token_type, new_debit_value, new_credit_value))
+        os.abort()
+
+    new_balance = new_credit_value - new_debit_value
+    log.debug("Account balance of '{}' tokens for {} is now {}".format(token_type, account_addr, new_balance))
+
+    res = namedb_account_transaction_save(cur, account_addr, token_type, new_credit_value, new_debit_value, block_id, vtxindex, txid, account)
+    if not res:
+        traceback.print_stack()
+        log.fatal("Failed to save new account state for {}".format(account_addr))
+        os.abort()
+
+    return True
+
+
+def namedb_accounts_vest(cur, block_height):
+    """
+    Vest tokens at this block to all recipients.
+    Goes through the vesting table and debits each account that should vest on this block.
+    """
+    sql = 'SELECT * FROM account_vesting WHERE block_id = ?'
+    args = (block_height,)
+
+    vesting_rows = namedb_query_execute(cur, sql, args)
+    rows = []
+    for row in vesting_rows:
+        tmp = {}
+        tmp.update(row)
+        rows.append(tmp)
+
+    for row in rows:
+        addr = row['address']
+        token_type = row['type']
+        token_amount = row['vesting_value']
+
+        log.debug("Vest {} with {} {}".format(addr, token_amount, token_type))
+        
+        fake_txid = namedb_vesting_txid(addr, token_type, token_amount, block_height)
+
+        res = namedb_account_credit(cur, addr, token_type, token_amount, block_height, 0, fake_txid)
+        if not res:
+            traceback.print_stack()
+            log.fatal('Failed to vest {} {} to {}'.format(token_amount, token_type, addr))
+            os.abort()
+
+    return True
+
+
 def namedb_is_history_snapshot( history_snapshot ):
     """
     Given a dict, verify that it is a history snapshot.
@@ -1225,6 +1595,8 @@ def namedb_is_history_snapshot( history_snapshot ):
 
 def namedb_history_save( cur, opcode, history_id, creator_address, value_hash, block_id, vtxindex, txid, accepted_rec, history_snapshot=False ):
     """
+    Insert data into the state engine's history.
+    It must be for a never-before-seen (txid,block_id,vtxindex) set.
     @history_id is either the name or namespace ID
 
     Return True on success
@@ -1261,37 +1633,17 @@ def namedb_history_save( cur, opcode, history_id, creator_address, value_hash, b
     return True
 
 
-def namedb_get_blocks_with_ops( cur, history_id, start_block_id, end_block_id ):
-    """
-    Get the block heights at which a name was affected by an operation.
-    Returns the list of heights.
-    Returns [] if there is no history for this item.
-    """
-    select_query = "SELECT DISTINCT name_records.block_number,history.block_id FROM history JOIN name_records ON history.history_id = name_records.name " + \
-                   "WHERE name_records.name = ? AND ((name_records.block_number >= ? OR history.block_id >= ?) AND (name_records.block_number < ? OR history.block_id < ?));"
-    args = (history_id, start_block_id, start_block_id, end_block_id, end_block_id)
-
-    history_rows = namedb_query_execute( cur, select_query, args )
-    ret = []
-
-    for r in history_rows:
-        if r['block_number'] not in ret:
-            ret.append(r['block_number'])
-
-        if r['block_id'] not in ret:
-            ret.append(r['block_id'])
-
-    ret.sort()
-    return ret
-
-
-def namedb_get_history_rows( cur, history_id, offset=None, count=None ):
+def namedb_get_history_rows( cur, history_id, offset=None, count=None, reverse=False ):
     """
     Get the history for a name or namespace from the history table.
     Use offset/count if given.
     """
     ret = []
-    select_query = "SELECT * FROM history WHERE history_id = ? ORDER BY block_id ASC, vtxindex ASC"
+    if not reverse:
+        select_query = "SELECT * FROM history WHERE history_id = ? ORDER BY block_id ASC, vtxindex ASC"
+    else:
+        select_query = "SELECT * FROM history WHERE history_id = ? ORDER BY block_id DESC, vtxindex DESC"
+
     args = (history_id,)
 
     if count is not None:
@@ -1325,14 +1677,13 @@ def namedb_get_num_history_rows( cur, history_id ):
     return count
 
 
-def namedb_get_history( cur, history_id ):
+def namedb_get_history( cur, history_id, offset=None, count=None, reverse=False ):
     """
     Get all of the history for a name or namespace.
     Returns a dict keyed by block heights, paired to lists of changes (see namedb_history_extract)
     """
-
     # get history in increasing order by block_id and then vtxindex
-    history_rows = namedb_get_history_rows( cur, history_id )
+    history_rows = namedb_get_history_rows( cur, history_id, offset=offset, count=count, reverse=reverse )
     return namedb_history_extract( history_rows )
 
 
@@ -1384,6 +1735,129 @@ def namedb_flatten_history( hist ):
         for vtxinfo in vtxinfos:
             info = copy.deepcopy(vtxinfo)
             ret.append(info)
+
+    return ret
+
+
+def namedb_get_account_tokens(cur, address):
+    """
+    Get an account's tokens
+    Returns the list of tokens on success
+    Returns None if not found
+    """
+    sql = 'SELECT DISTINCT type FROM accounts WHERE address = ?;'
+    args = (address,)
+
+    rows = namedb_query_execute(cur, sql, args)
+    ret = []
+    for row in rows:
+        ret.append(row['type'])
+
+    return ret
+
+
+def namedb_get_account(cur, address, token_type):
+    """
+    Get an account, given the address.
+    Returns the account row on success
+    Returns None if not found
+    """
+    sql = 'SELECT * FROM accounts WHERE address = ? AND type = ? ORDER BY block_id DESC, vtxindex DESC LIMIT 1;'
+    args = (address,token_type)
+
+    rows = namedb_query_execute(cur, sql, args)
+    row = rows.fetchone()
+    if row is None:
+        return None
+
+    ret = {}
+    ret.update(row)
+    return ret
+
+
+def namedb_get_account_delta(cur, address, token_type, block_id, vtxindex):
+    """
+    Get the account state for a token type at the given (block_id,vtxindex), plus the account state for
+    the same token type at the prior operation.
+
+    The current account must have been debited or credited at (block_id,vtxindex)
+
+    Returns {'current': ..., 'prior': ...} on success
+    Returns None on error
+    """
+    sql = 'SELECT * FROM accounts WHERE address = ? AND type = ? AND (block_id <= ? OR block_id == ? AND vtxindex <= ?) ORDER BY block_id DESC, vtxindex DESC LIMIT 2;'
+    args = (address, token_type, block_id, block_id, vtxindex)
+
+    rows = namedb_query_execute(cur, sql, args)
+    data = []
+    for r in rows:
+        tmp = {}
+        tmp.update(r)
+        data.append(tmp)
+
+    if len(data) != 2:
+        return None
+
+    # the current account state must land on this block_id/vtxindex
+    if data[0]['block_id'] != block_id or data[0]['vtxindex'] != vtxindex:
+        return None
+
+    return {'current': data[0], 'prior': data[1]}
+
+
+def namedb_get_account_diff(current, prior):
+    """
+    Figure out what the expenditure difference is between two accounts.
+    They must be for the same token type and address.
+    Calculates current - prior
+    """
+    if current['address'] != prior['address'] or current['type'] != prior['type']:
+        raise ValueError("Accounts for two different addresses and/or token types")
+
+    # NOTE: only possible since Python doesn't overflow :P
+    return namedb_get_account_balance(current) - namedb_get_account_balance(prior)
+
+
+def namedb_get_account_history(cur, address, offset=None, count=None):
+    """
+    Get the history of an account's tokens
+    """
+    sql = 'SELECT * FROM accounts WHERE address = ? ORDER BY block_id DESC, vtxindex DESC'
+    args = (address,)
+
+    if count is not None:
+        sql += ' LIMIT ?'
+        args += (count,)
+
+    if offset is not None:
+        sql += ' OFFSET ?'
+        args += (offset,)
+
+    sql += ';'
+    rows = namedb_query_execute(cur, sql, args)
+
+    ret = []
+    for rowdata in rows:
+        tmp = {}
+        tmp.update(rowdata)
+        ret.append(tmp)
+
+    return ret
+
+
+def namedb_get_all_account_addresses(cur):
+    """
+    TESTING ONLY
+    get all account addresses
+    """
+    assert BLOCKSTACK_TEST, 'BUG: this method is only available in test mode'
+    sql = 'SELECT DISTINCT address FROM accounts;'
+    args = ()
+    rows = namedb_query_execute(cur, sql, args)
+
+    ret = []
+    for rowdata in rows:
+        ret.append(rowdata['address'])
 
     return ret
 
@@ -1501,12 +1975,15 @@ def namedb_select_where_unexpired_names(current_block, only_registered=True):
     If only_registered is False, then as long as current_block is before the expire block, then the name will be returned (but the name may not have existed at that block)
     """
 
+    ns_lifetime_multiplier = get_epoch_namespace_lifetime_multiplier(current_block, '*')
+    ns_grace_period = get_epoch_namespace_lifetime_grace_period(current_block, '*')
+
     unexpired_query_fragment =  "(" + \
                                     "(" + \
                                         "namespaces.op = ? AND " + \
                                         "(" + \
-                                            "(namespaces.ready_block + ((namespaces.lifetime * namespace_lifetime_multiplier(?, namespaces.namespace_id)) + namespace_lifetime_grace_period(?, namespaces.namespace_id)) > ?) OR " + \
-                                            "(name_records.last_renewed + ((namespaces.lifetime * namespace_lifetime_multiplier(?, namespaces.namespace_id)) + namespace_lifetime_grace_period(?, namespaces.namespace_id)) >= ?)" + \
+                                            "(namespaces.ready_block + ((namespaces.lifetime * {}) + {}) > ?) OR ".format(ns_lifetime_multiplier, ns_grace_period) + \
+                                            "(name_records.last_renewed + ((namespaces.lifetime * {}) + {}) >= ?)".format(ns_lifetime_multiplier, ns_grace_period) + \
                                         ")" + \
                                     ") OR " + \
                                     "(" + \
@@ -1515,8 +1992,8 @@ def namedb_select_where_unexpired_names(current_block, only_registered=True):
                                 ")"
 
     unexpired_query_args = (NAMESPACE_READY, 
-                                current_block, current_block, current_block, 
-                                current_block, current_block, current_block,
+                                current_block,
+                                current_block,
                             NAMESPACE_REVEAL, current_block, current_block, NAMESPACE_REVEAL_EXPIRE)
 
     if only_registered:
@@ -1623,7 +2100,7 @@ def namedb_get_record_states_at(cur, history_id, block_number):
         # record changed in this block
         return ret
     
-    # if the name did not change in this block, then find the last version of the name
+    # if the record did not change in this block, then find the last version of the record
     query = 'SELECT block_id,history_data FROM history WHERE history_id = ? AND block_id < ? ORDER BY block_id DESC,vtxindex DESC LIMIT 1'
     args = (history_id, block_number)
     history_rows = namedb_query_execute(cur, query, args)
@@ -1634,6 +2111,41 @@ def namedb_get_record_states_at(cur, history_id, block_number):
 
     return ret
 
+
+def namedb_get_account_at(cur, address, block_number):
+    """
+    Get the state(s) that a given account was in at a given block height
+    Normally this is one state if nothing happened in this block.
+    Otherwise, this is one or more states.
+
+    Returns an array of states
+    """
+    query = 'SELECT * FROM accounts WHERE address = ? AND block_id = ? ORDER BY block_id DESC, vtxindex DESC'
+    args = (address, block_number)
+    history_rows = namedb_query_execute(cur, query, args)
+    ret = []
+
+    for row in history_rows:
+        tmp = {}
+        tmp.update(row)
+        ret.append(tmp)
+
+    if len(ret) > 0:
+        # account changed in this block
+        return ret
+    
+    # if the account did not change in this block, then find the latest version of this account at this block
+    query = 'SELECT * from accounts WHERE address = ? AND block_id < ? ORDER BY block_id DESC,vtxindex DESC LIMIT 1'
+    args = (address, block_number)
+    history_rows = namedb_query_execute(cur, query, args)
+
+    for row in history_rows:
+        tmp = {}
+        tmp.update(row)
+        ret.append(tmp)
+
+    return ret
+    
 
 def namedb_get_name_at(cur, name, block_number, include_expired=False):
     """
@@ -1682,6 +2194,23 @@ def namedb_get_namespace_at(cur, namespace_id, block_number, include_expired=Fal
         return history_rows
 
 
+def namedb_get_account_balance(account):
+    """
+    Get the balance of an account for a particular type of token.
+    This is its credits minus its debits.
+    Returns the current balance on success.
+    Aborts on error, or if the balance is somehow negative.
+    """
+    # NOTE: this is only possible because Python does not overflow :P
+    balance = account['credit_value'] - account['debit_value']
+    if balance < 0:
+        log.fatal("Balance of {} is {} (credits = {}, debits = {})".format(account['address'], balance, account['credit_value'], account['debit_value']))
+        traceback.print_stack()
+        os.abort()
+
+    return balance
+
+
 def namedb_get_preorder(cur, preorder_hash, current_block_number, include_expired=False, expiry_time=None):
     """
     Get a preorder record by hash.
@@ -1702,7 +2231,7 @@ def namedb_get_preorder(cur, preorder_hash, current_block_number, include_expire
         args = (preorder_hash, expiry_time + current_block_number)
 
     preorder_rows = namedb_query_execute( cur, select_query, (preorder_hash,))
-    preorder_row = preorder_row.fetchone()
+    preorder_row = preorder_rows.fetchone()
     if preorder_row is None:
         # no such preorder 
         return None
@@ -1721,7 +2250,7 @@ def namedb_get_names_owned_by_address( cur, address, current_block ):
 
     unexpired_fragment, unexpired_args = namedb_select_where_unexpired_names( current_block )
 
-    select_query = "SELECT * FROM name_records JOIN namespaces ON name_records.namespace_id = namespaces.namespace_id " + \
+    select_query = "SELECT name FROM name_records JOIN namespaces ON name_records.namespace_id = namespaces.namespace_id " + \
                    "WHERE name_records.address = ? AND name_records.revoked = 0 AND " + unexpired_fragment + ";"
     args = (address,) + unexpired_args
 
@@ -1819,10 +2348,12 @@ def namedb_select_count_rows( cur, query, args, count_column='COUNT(*)' ):
     return count
 
 
-def namedb_get_all_ops_at(db, block_id, offset=None, count=None):
+def namedb_get_all_blockstack_ops_at(db, block_id, offset=None, count=None):
     """
-    Get the states that each name and namespace record
-    passed through in the given block.
+    Get the states that each name, namespace, and account record
+    passed through in the given block.  Note that this only concerns
+    operations written on-chain, for use in SNV and database verification
+    (i.e. does not include implicit account debits and account vesting).
 
     Return the list of prior record states, ordered by vtxindex.
     """
@@ -1834,7 +2365,7 @@ def namedb_get_all_ops_at(db, block_id, offset=None, count=None):
     # how many preorders at this block?
     offset_count_query, offset_count_args = namedb_offset_count_predicate(offset=offset, count=count)
 
-    preorder_count_rows_query = "SELECT COUNT(*) FROM preorders WHERE block_number = ? " + " " + offset_count_query + ";"
+    preorder_count_rows_query = "SELECT COUNT(*) FROM preorders WHERE block_number = ? ORDER BY vtxindex " + " " + offset_count_query + ";"
     preorder_count_rows_args = (block_id,) + offset_count_args
 
     # log.debug(namedb_format_query(preorder_count_rows_query, preorder_count_rows_args))
@@ -1869,7 +2400,7 @@ def namedb_get_all_ops_at(db, block_id, offset=None, count=None):
             # done!
             return ret
 
-    # get all other operations at this block
+    # get all other operations at this block (name ops, namespace ops, token ops)
     offset_count_query, offset_count_args = namedb_offset_count_predicate(offset=offset, count=count)
     query = "SELECT history_data FROM history WHERE block_id = ? ORDER BY vtxindex " + offset_count_query + ";"
     args = (block_id,) + offset_count_args
@@ -1897,9 +2428,9 @@ def namedb_get_all_ops_at(db, block_id, offset=None, count=None):
     return ret
 
 
-def namedb_get_num_ops_at( db, block_id ):
+def namedb_get_num_blockstack_ops_at( db, block_id ):
     """
-    Get the number of operations that occurred at a particular block.
+    Get the number of name/namespace/token operations that occurred at a particular block.
     """
     cur = db.cursor()
 
@@ -2308,6 +2839,24 @@ def namedb_get_num_block_vtxs( cur, block_number ):
     return count
 
 
+def namedb_is_name_zonefile_hash(cur, name, zonefile_hash):
+    """
+    Determine if a zone file hash was sent by a name.
+    Return True if so, false if not
+    """
+    select_query = 'SELECT COUNT(value_hash) FROM history WHERE history_id = ? AND value_hash = ?'
+    select_args = (name,zonefile_hash)
+
+    rows = namedb_query_execute(cur, select_query, select_args)
+    count = None
+
+    for r in rows:
+        count = r['COUNT(value_hash)']
+        break
+
+    return count > 0
+
+
 if __name__ == "__main__":
     # basic unit tests
     import random 
@@ -2315,7 +2864,7 @@ if __name__ == "__main__":
 
     path = "/tmp/namedb.sqlite"
     if not os.path.exists( path ):
-        db = namedb_create( path )
+        db = namedb_create( path, {'rows': [], 'history': []})
     else:
         db = namedb_open( path )
 

@@ -1,29 +1,30 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 """
-    Blockstack-client
+    Blockstack
     ~~~~~
     copyright: (c) 2014-2015 by Halfmoon Labs, Inc.
     copyright: (c) 2016 by Blockstack.org
 
-    This file is part of Blockstack-client.
+    This file is part of Blockstack.
 
-    Blockstack-client is free software: you can redistribute it and/or modify
+    Blockstack is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
 
-    Blockstack-client is distributed in the hope that it will be useful,
+    Blockstack is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
     You should have received a copy of the GNU General Public License
-    along with Blockstack-client. If not, see <http://www.gnu.org/licenses/>.
+    along with Blockstack. If not, see <http://www.gnu.org/licenses/>.
 """
 
 import sys
 import os
 
+import xmlrpclib
 from xmlrpclib import ServerProxy, Transport
 from defusedxml import xmlrpc
 import httplib
@@ -34,12 +35,13 @@ import random
 import json
 import traceback
 import re
+import urllib
 import urllib2
 import socket
 from .util import url_to_host_port, url_protocol, parse_DID
-from .config import MAX_RPC_LEN, BLOCKSTACK_TEST, BLOCKSTACK_DEBUG, RPC_SERVER_PORT, RPC_SERVER_TEST_PORT, LENGTHS, RPC_DEFAULT_TIMEOUT, BLOCKSTACK_TEST
+from .config import MAX_RPC_LEN, BLOCKSTACK_TEST, BLOCKSTACK_DEBUG, RPC_SERVER_PORT, RPC_SERVER_TEST_PORT, LENGTHS, RPC_DEFAULT_TIMEOUT, BLOCKSTACK_TEST, get_blockstack_api_opts, TOKEN_TYPE_STACKS
 from .schemas import *
-from .scripts import is_name_valid, is_subdomain
+from .scripts import is_name_valid, is_subdomain, check_name, check_subdomain
 from .storage import verify_zonefile
 
 import virtualchain
@@ -63,11 +65,41 @@ class TimeoutHTTPConnection(httplib.HTTPConnection):
         httplib.HTTPConnection.connect(self)
         self.sock.settimeout(self.timeout)
 
+    def putheader(self, header, argument, *args, **kw):
+        if header.lower() == 'host':
+            if hasattr(self, '_sent_host') and self._sent_host:
+                # don't re-send 
+                return 
+            
+            self._sent_host = True
+
+        httplib.HTTPConnection.putheader(self, header, argument, *args, **kw)
+
+    def putrequest(self, request, selector, **kw):
+        # handled in the Transport
+        kw['skip_host'] = True
+        httplib.HTTPConnection.putrequest(self, request, selector, **kw)
+
 
 class TimeoutHTTPSConnection(httplib.HTTPSConnection):
     def connect(self):
         httplib.HTTPSConnection.connect(self)
         self.sock.settimeout(self.timeout)
+
+    def putheader(self, header, argument, *args, **kw):
+        if header.lower() == 'host':
+            if hasattr(self, '_sent_host') and self._sent_host:
+                # don't re-send 
+                return 
+            
+            self._sent_host = True
+
+        httplib.HTTPSConnection.putheader(self, header, argument, *args, **kw)
+
+    def putrequest(self, request, selector, **kw):
+        # handled in the Transport
+        kw['skip_host'] = True
+        httplib.HTTPSConnection.putrequest(self, request, selector, **kw)
 
 
 class TimeoutHTTP(httplib.HTTP):
@@ -106,6 +138,16 @@ class TimeoutTransport(Transport):
 
         conn.set_timeout(self.timeout)
         return conn
+
+    def send_host(self, connection, host):
+        # NOTE: this is a no-op these days, so we have to send the Host header ourselves
+        Transport.send_host(self, connection, host)
+
+        auth, hostname = urllib.splituser(host)
+        if ':' in hostname:
+            hostname = hostname.split(':')[0]
+
+        connection.putheader('Host', hostname)
 
 
 class TimeoutServerProxy(ServerProxy):
@@ -165,8 +207,15 @@ class BlockstackRPCClient(object):
                     log.error(msg)
                     res = {'error': msg}
 
-                self.log_debug_timeline('end', key, r)
+                except xmlrpclib.ProtocolError as pe:
+                    msg = 'Server replied ProtocolError: {} {}'.format(pe.errcode, pe.errmsg)
+                    if BLOCKSTACK_TEST is not None:
+                        log.debug('{}: {}'.format(msg, res))
 
+                    log.error(msg)
+                    res = {'error': msg}
+
+                self.log_debug_timeline('end', key, r)
                 return res
 
             return inner
@@ -185,7 +234,7 @@ def json_is_error(resp):
     if not isinstance(resp, dict):
         return False
 
-    return 'error' in resp
+    return 'error' in resp or 'traceback' in resp
 
 
 def json_is_exception(resp):
@@ -205,6 +254,30 @@ def json_is_exception(resp):
     return True
 
 
+def json_validate_error(resp):
+    """
+    See if this is a well-formed error
+    """
+    error_schema = {
+        'type': 'object',
+        'properties': {
+            'error': {
+                'type': 'string',
+            },
+            'http_status': {
+                'type': 'integer',
+            },
+        },
+        'required': [
+            'error',
+            'http_status',
+        ]
+    }
+
+    jsonschema.validate(resp, error_schema)
+    return True
+
+
 def json_validate(schema, resp):
     """
     Validate an RPC response.
@@ -215,22 +288,21 @@ def json_validate(schema, resp):
     Returns the resp on success
     Returns {'error': ...} on validation error
     """
-    error_schema = {
-        'type': 'object',
-        'properties': {
-            'error': {
-                'type': 'string'
-            }
-        },
-        'required': [
-            'error'
-        ]
-    }
-
     # is this an error?
     try:
-        jsonschema.validate(resp, error_schema)
+        json_validate_error(resp)
     except ValidationError:
+        if json_is_exception(resp):
+            # got a traceback 
+            if BLOCKSTACK_TEST:
+                log.error('\n{}'.format(resp['traceback']))
+
+            return {'error': 'Blockstack Core encountered an exception. See `traceback` for details', 'traceback': resp['traceback'], 'http_status': 500}
+
+        if 'error' in resp and 'http_status' not in resp:
+            # bad error message
+            raise 
+
         # not an error.
         jsonschema.validate(resp, schema)
 
@@ -246,7 +318,7 @@ def json_traceback(error_msg=None):
 
     exception_data = traceback.format_exc().splitlines()
     if error_msg is None:
-        error_msg = exception_data[-1]
+        error_msg = '\n'.join(exception_data)
     else:
         error_msg = 'Remote RPC error: {}'.format(error_msg)
 
@@ -297,6 +369,20 @@ def json_response_schema( expected_object_schema ):
     return schema
 
 
+def get_blockstackd_url():
+    """
+    Get the URL to the blockstackd RPC server instance
+    """
+    conf = get_blockstack_api_opts()
+    if conf is None:
+        return None
+    
+    if not conf['enabled']:
+        return None
+
+    return conf['indexer_url']
+
+
 def connect_hostport(hostport, timeout=RPC_DEFAULT_TIMEOUT, my_hostport=None):
     """
     Connect to the given "host:port" string
@@ -316,6 +402,17 @@ def connect_hostport(hostport, timeout=RPC_DEFAULT_TIMEOUT, my_hostport=None):
 
     proxy = BlockstackRPCClient(host, port, timeout=timeout, src=my_hostport, protocol=protocol)
     return proxy
+
+
+def create_bitcoind_service_proxy(rpc_username, rpc_password, server='127.0.0.1', port=8332, use_https=False):
+    """
+    create a bitcoind service proxy
+    """
+    assert BLOCKSTACK_TEST, 'create_bitcoind_service_proxy can only be used in test mode!'
+
+    protocol = 'https' if use_https else 'http'
+    uri = '%s://%s:%s@%s:%s' % (protocol, rpc_username, rpc_password, server, port)
+    return virtualchain.AuthServiceProxy(uri)
 
 
 def ping(proxy=None, hostport=None):
@@ -354,16 +451,17 @@ def ping(proxy=None, hostport=None):
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
 
     except socket.timeout:
         log.error("Connection timed out")
-        resp = {'error': 'Connection to remote host timed out.'}
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
         return resp
 
     except socket.error as se:
         log.error("Connection error {}".format(se.errno))
-        resp = {'error': 'Connection to remote host failed.'}
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -371,7 +469,7 @@ def ping(proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp
@@ -440,22 +538,24 @@ def getinfo(proxy=None, hostport=None):
         if json_is_error(resp):
             if BLOCKSTACK_TEST:
                 log.debug("invalid response: {}".format(old_resp))
+
             return resp
 
     except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
 
     except socket.timeout:
         log.error("Connection timed out")
-        resp = {'error': 'Connection to remote host timed out.'}
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
         return resp
 
     except socket.error as se:
         log.error("Connection error {}".format(se.errno))
-        resp = {'error': 'Connection to remote host failed.'}
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -463,15 +563,16 @@ def getinfo(proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp
 
 
-def get_zonefile_inventory(hostport, bit_offset, bit_count, timeout=30, my_hostport=None, proxy=None):
+def get_zonefile_inventory(hostport, offset, count, timeout=30, my_hostport=None, proxy=None):
     """
     Get the atlas zonefile inventory from the given peer.
+    offset/count are in bytes.
     Return {'status': True, 'inv': inventory} on success.
     Return {'error': ...} on error
     """
@@ -498,7 +599,7 @@ def get_zonefile_inventory(hostport, bit_offset, bit_count, timeout=30, my_hostp
 
     zf_inv = None
     try:
-        zf_inv = proxy.get_zonefile_inventory(bit_offset, bit_count)
+        zf_inv = proxy.get_zonefile_inventory(offset, count)
         zf_inv = json_validate(schema, zf_inv)
         if json_is_error(zf_inv):
             return zf_inv
@@ -507,21 +608,30 @@ def get_zonefile_inventory(hostport, bit_offset, bit_count, timeout=30, my_hostp
         zf_inv['inv'] = base64.b64decode(str(zf_inv['inv']))
 
         # make sure it corresponds to this range
-        assert len(zf_inv['inv']) <= (bit_count / 8) + (bit_count % 8), 'Zonefile inventory in is too long (got {} bytes)'.format(len(zf_inv['inv']))
-    except (ValidationError, AssertionError) as e:
-        if BLOCKSTACK_DEBUG:
-            log.exception(e)
+        assert len(zf_inv['inv']) <= count, 'Zonefile inventory in is too long (got {} bytes)'.format(len(zf_inv['inv']))
 
-        zf_inv = {'error': 'Failed to fetch and parse zonefile inventory'}
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except AssertionError as ae:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ae)
+
+        resp = {'error': 'Server replied an invalid zone file inventory vector'}
+        return resp
 
     except socket.timeout:
         log.error("Connection timed out")
-        resp = {'error': 'Connection to remote host timed out.'}
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
         return resp
 
     except socket.error as se:
         log.error("Connection error {}".format(se.errno))
-        resp = {'error': 'Connection to remote host failed.'}
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -529,7 +639,7 @@ def get_zonefile_inventory(hostport, bit_offset, bit_count, timeout=30, my_hostp
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return zf_inv
@@ -575,24 +685,25 @@ def get_atlas_peers(hostport, timeout=30, my_hostport=None, proxy=None):
         for peer_hostport in peer_list_resp['peers']:
             peer_host, peer_port = url_to_host_port(peer_hostport)
             if peer_host is None or peer_port is None:
-                return {'error': 'Invalid peer listing'}
+                return {'error': 'Server did not return valid Atlas peers', 'http_status': 503}
 
         peers = peer_list_resp
 
-    except (ValidationError, AssertionError) as e:
+    except ValidationError as ve:
         if BLOCKSTACK_DEBUG:
-            log.exception(e)
+            log.exception(ve)
 
-        peers = json_traceback()
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
 
     except socket.timeout:
         log.error("Connection timed out")
-        resp = {'error': 'Connection to remote host timed out.'}
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
         return resp
 
     except socket.error as se:
         log.error("Connection error {}".format(se.errno))
-        resp = {'error': 'Connection to remote host failed.'}
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -600,7 +711,7 @@ def get_atlas_peers(hostport, timeout=30, my_hostport=None, proxy=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node {}.  Try again with `--debug`.'.format(hostport)}
+        resp = {'error': 'Failed to contact Blockstack node {}.  Try again with `--debug`.'.format(hostport), 'http_status': 500}
         return resp
 
     return peers
@@ -646,24 +757,25 @@ def atlas_peer_exchange(hostport, my_hostport, timeout=30, proxy=None):
         for peer_hostport in peer_list_resp['peers']:
             peer_host, peer_port = url_to_host_port(peer_hostport)
             if peer_host is None or peer_port is None:
-                return {'error': 'Invalid peer listing'}
+                return {'error': 'Server did not return valid Atlas peers', 'http_status': 503}
 
         peers = peer_list_resp
 
-    except (ValidationError, AssertionError) as e:
+    except ValidationError as ve:
         if BLOCKSTACK_DEBUG:
-            log.exception(e)
+            log.exception(ve)
 
-        peers = json_traceback()
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
 
     except socket.timeout:
         log.error("Connection timed out")
-        resp = {'error': 'Connection to remote host timed out.'}
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
         return resp
 
     except socket.error as se:
         log.error("Connection error {}".format(se.errno))
-        resp = {'error': 'Connection to remote host failed.'}
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -671,7 +783,7 @@ def atlas_peer_exchange(hostport, my_hostport, timeout=30, proxy=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node {}.  Try again with `--debug`.'.format(hostport)}
+        resp = {'error': 'Failed to contact Blockstack node {}.  Try again with `--debug`.'.format(hostport), 'http_status': 500}
         return resp
 
     return peers
@@ -734,19 +846,31 @@ def get_zonefiles(hostport, zonefile_hashes, timeout=30, my_hostport=None, proxy
             log.exception(ae)
 
         zonefiles = {'error': 'Zonefile data mismatch'}
+        return zonefiles
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
 
     except ValidationError as ve:
         if BLOCKSTACK_DEBUG:
             log.exception(ve)
 
-        zonefiles = json_traceback()
+        zonefiles = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return zonefiles
 
     except Exception as ee:
         if BLOCKSTACK_DEBUG:
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return zonefiles
@@ -793,24 +917,96 @@ def put_zonefiles(hostport, zonefile_data_list, timeout=30, my_hostport=None, pr
         if json_is_error(push_info):
             return push_info
 
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
     except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        push_info = json_traceback()
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
 
     except Exception as ee:
         if BLOCKSTACK_DEBUG:
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return push_info
 
 
-def get_name_record(name, include_history=False, include_expired=False, include_grace=True, proxy=None, hostport=None):
+def get_zonefiles_by_block(from_block, to_block, hostport=None, proxy=None):
+    """
+    Get zonefile information for zonefiles announced in [@from_block, @to_block]
+    Returns { 'last_block' : server's last seen block,
+              'zonefile_info' : [ { 'zonefile_hash' : '...',
+                                    'txid' : '...',
+                                    'block_height' : '...' } ] }
+    """
+    assert hostport or proxy, 'need either hostport or proxy'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    zonefile_info_schema = {
+        'type' : 'array',
+        'items' : {
+            'type' : 'object',
+            'properties' : {
+                'name' : {'type' : 'string'},
+                'zonefile_hash' : { 'type' : 'string',
+                                    'pattern' : OP_ZONEFILE_HASH_PATTERN },
+                'txid' : {'type' : 'string',
+                          'pattern' : OP_TXID_PATTERN},
+                'block_height' : {'type' : 'integer'}
+            },
+            'required' : [ 'zonefile_hash', 'txid', 'block_height' ]
+        }
+    }
+    response_schema = {
+        'type' : 'object',
+        'properties' : {
+            'lastblock' : {'type' : 'integer'},
+            'zonefile_info' : zonefile_info_schema
+        },
+        'required' : ['lastblock', 'zonefile_info']
+    }
+
+    offset = 0
+    output_zonefiles = []
+    last_server_block = 0
+
+    resp = {'zonefile_info': []}
+
+    while offset == 0 or len(resp['zonefile_info']) > 0:
+
+        resp = proxy.get_zonefiles_by_block(from_block, to_block, offset, 100)
+        if 'error' in resp:
+            return resp
+
+        resp = json_validate(response_schema, resp)
+        if json_is_error(resp):
+            return resp
+
+        output_zonefiles += resp['zonefile_info']
+        offset += 100
+        last_server_block = max(resp['lastblock'], last_server_block)
+
+    return { 'last_block' : last_server_block,
+             'zonefile_info' : output_zonefiles }
+
+
+def get_name_record(name, include_history=False, include_expired=False, include_grace=True, proxy=None, hostport=None,
+                    history_page=None):
     """
     Get the record for a name or a subdomain.  Optionally include its history, and optionally return an expired name or a name in its grace period.
     Return the blockchain-extracted information on success.
@@ -872,24 +1068,38 @@ def get_name_record(name, include_history=False, include_expired=False, include_
     lastblock = None
     try:
         if include_history:
-            resp = proxy.get_name_blockchain_record(name)
+            resp = get_name_and_history(name, proxy=proxy, history_page=history_page)
+            if 'error' in resp:
+                # fall back to legacy path
+                log.debug(resp)
+                resp = proxy.get_name_blockchain_record(name)
         else:
             resp = proxy.get_name_record(name)
 
         resp = json_validate(resp_schema, resp)
         if json_is_error(resp):
             if resp['error'] == 'Not found.':
-                return {'error': 'Not found.'}
+                return {'error': 'Not found.', 'http_status': resp.get('http_status', 404)}
 
             return resp
 
         lastblock = resp['lastblock']
 
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
     except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
         return resp
     
     except Exception as ee:
@@ -897,25 +1107,29 @@ def get_name_record(name, include_history=False, include_expired=False, include_
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     if not include_expired and is_blockstack_id:
         # check expired
         if lastblock is None:
-            return {'error': 'No lastblock given from server'}
+            return {'error': 'No lastblock given from server', 'http_status': 503}
 
         if include_grace:
             # only care if the name is beyond the grace period
-            if lastblock > int(resp['record']['renewal_deadline']) and int(resp['record']['renewal_deadline']) > 0:
-                return {'error': 'Name expired'}
-            elif int(resp['record']['renewal_deadline']) > 0:
+            if lastblock >= int(resp['record']['renewal_deadline']) and int(resp['record']['renewal_deadline']) > 0:
+                return {'error': 'Name expired', 'http_status': 404}
+
+            elif int(resp['record']['renewal_deadline']) > 0 and lastblock >= int(resp['record']['expire_block']) and lastblock < int(resp['record']['renewal_deadline']):
                 resp['record']['grace_period'] = True
+
+            else:
+                resp['record']['grace_period'] = False
 
         else:
             # only care about expired, even if it's in the grace period
-            if lastblock > resp['record']['expire_block'] and int(resp['record']['expire_block']) > 0:
-                return {'error': 'Name expired'}
+            if lastblock > int(resp['record']['expire_block']) and int(resp['record']['expire_block']) > 0:
+                return {'error': 'Name expired', 'http_status': 404}
 
     return resp['record']
 
@@ -960,18 +1174,30 @@ def get_namespace_record(namespace_id, proxy=None, hostport=None):
 
         # this isn't needed
         ret.pop('opcode', None)
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
     except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        ret = json_traceback(ret.get('error'))
-        return ret
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
     except Exception as ee:
         if BLOCKSTACK_DEBUG:
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return ret
@@ -981,45 +1207,83 @@ def get_name_cost(name, proxy=None, hostport=None):
     """
     name_cost
     Returns the name cost info on success
+    Returns {'amount': ..., 'units': ...} on success
     Returns {'error': ...} on error
     """
     assert proxy or hostport, 'Need proxy or hostport'
     if proxy is None:
         proxy = connect_hostport(hostport)
 
-    schema = {
+    cost_schema_v1 = {
         'type': 'object',
         'properties': {
-            'status': {
-                'type': 'boolean',
-            },
             'satoshis': {
                 'type': 'integer',
                 'minimum': 0,
             },
         },
         'required': [
-            'status',
             'satoshis'
         ]
     }
 
+    cost_schema_v2 = {
+        'type': 'object',
+        'properties': {
+            'units': {
+                'type': 'string',
+            },
+            'amount': {
+                'type': 'integer',
+                'minimum': 0,
+            },
+        },
+        'required': [
+            'units',
+            'amount',
+        ]
+    }
+
+    resp_version = None
+    resp_schema_v1 = json_response_schema(cost_schema_v1)
+    resp_schema_v2 = json_response_schema(cost_schema_v2)
+
     resp = {}
     try:
         resp = proxy.get_name_cost(name)
-        resp = json_validate( schema, resp )
+        try:
+            resp = json_validate(resp_schema_v2, resp)
+        except:
+            resp = json_validate(resp_schema_v1, resp)
+            if not json_is_error(resp):
+                resp = {'units': 'BTC', 'amount': resp['satoshis']}
+
         if json_is_error(resp):
             return resp
 
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
     except ValidationError as e:
-        resp = json_traceback(resp.get('error'))
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
 
     except Exception as ee:
         if BLOCKSTACK_DEBUG:
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp
@@ -1028,47 +1292,396 @@ def get_name_cost(name, proxy=None, hostport=None):
 def get_namespace_cost(namespace_id, proxy=None, hostport=None):
     """
     namespace_cost
-    Returns the namespace cost info on success
+    Returns the namespace cost info on success.
+    Returns {'amount': ..., 'units': ...} on success (optionally with 'satoshis': ... if the namespace is priced in BTC)
     Returns {'error': ...} on error
     """
     assert proxy or hostport, 'Need proxy or hostport'
     if proxy is None:
         proxy = connect_hostport(hostport)
 
-    cost_schema = {
+    cost_schema_v1 = {
         'type': 'object',
         'properties': {
             'satoshis': {
                 'type': 'integer',
                 'minimum': 0,
-            }
+            },
         },
         'required': [
             'satoshis'
-        ]
+        ],
     }
 
-    schema = json_response_schema(cost_schema)
+    cost_schema_v2 = {
+        'type': 'object',
+        'properties': {
+            'units': {
+                'type': 'string',
+                'pattern': '^BTC$|^{}$'.format(TOKEN_TYPE_STACKS),
+            },
+            'amount': {
+                'type': 'integer',
+                'minimum': 0,
+            },
+        },
+        'required': [
+            'units',
+            'amount',
+        ],
+    }
+
+    schema_v1 = json_response_schema(cost_schema_v1)
+    schema_v2 = json_response_schema(cost_schema_v2)
 
     resp = {}
     try:
         resp = proxy.get_namespace_cost(namespace_id)
-        resp = json_validate( cost_schema, resp )
+        try:
+            resp = json_validate(cost_schema_v2, resp)
+        except:
+            resp = json_validate(cost_schema_v1, resp)
+            if not json_is_error(resp):
+                resp = {'units': 'BTC', 'amount': resp['satoshis']}
+
         if json_is_error(resp):
             return resp
 
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
     except ValidationError as e:
-        resp = json_traceback(resp.get('error'))
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
 
     except Exception as ee:
         if BLOCKSTACK_DEBUG:
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp
+
+
+def get_account_tokens(address, hostport=None, proxy=None):
+    """
+    Get the types of tokens that an address owns
+    Returns a list of token types
+    """
+    assert proxy or hostport, 'Need proxy or hostport'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    tokens_schema = {
+        'type': 'object',
+        'properties': {
+            'token_types': {
+                'type': 'array',
+                'pattern': '^(.+){1,19}',
+            },
+        },
+        'required': [
+            'token_types',
+        ]
+    }
+
+    schema = json_response_schema(tokens_schema)
+
+    try:
+        resp = proxy.get_account_tokens(address)
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except AssertionError as ae:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ae)
+
+        resp = json_traceback(resp.get('error'))
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+
+    resp['token_types'].sort()
+    return resp['token_types']
+
+
+def get_account_record(address, token_type, hostport=None, proxy=None):
+    """
+    Get the current state of the account
+    Returns the account record on success
+    """
+    assert proxy or hostport, 'Need proxy or hostport'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    account_schema = {
+        'type': 'object',
+        'properties': {
+            'account': {
+                'type': 'object',
+                'properties': ACCOUNT_SCHEMA_PROPERTIES,
+                'required': ACCOUNT_SCHEMA_REQUIRED,
+            },
+        },
+        'required': [
+            'account'
+        ],
+    }
+
+    schema = json_response_schema(account_schema)
+
+    try:
+        resp = proxy.get_account_record(address, token_type)
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+    except ValidationError as e:
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+   
+    return resp['account']
+
+
+def get_account_balance(address, token_type, hostport=None, proxy=None):
+    """
+    Get the balance of an account for a particular token
+    Returns an int
+    """
+    assert proxy or hostport, 'Need proxy or hostport'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    balance_schema = {
+        'type': 'object',
+        'properties': {
+            'balance': {
+                'type': 'integer',
+            },
+        },
+        'required': [
+            'balance',
+        ],
+    }
+
+    schema = json_response_schema(balance_schema)
+
+    try:
+        resp = proxy.get_account_balance(address, token_type)
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+    except ValidationError as e:
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+
+    return resp['balance']
+
+
+def get_account_at(address, block_height, hostport=None, proxy=None):
+    """
+    Get the state(s) that an account was in at a given block
+    Returns the list of account operations on success
+    Returns {'error': ...} on error
+    """
+    assert proxy or hostport, 'Need proxy or hostport'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    page_schema = {
+        'type': 'object',
+        'properties': {
+            'history': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': ACCOUNT_SCHEMA_PROPERTIES,
+                    'required': ACCOUNT_SCHEMA_REQUIRED,
+                },
+            },
+        },
+        'required': [
+            'history'
+        ],
+    }
+
+    schema = json_response_schema(page_schema)
+
+    try:
+        resp = proxy.get_account_at(address, block_height)
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+    except ValidationError as e:
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+
+    return resp['history']
+
+
+def get_account_history_page(address, page, hostport=None, proxy=None):
+    """
+    Get a page of the account's history
+    Returns the list of account operations on success
+    Returns {'error': ...} on error
+    """
+    assert proxy or hostport, 'Need proxy or hostport'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    page_schema = {
+        'type': 'object',
+        'properties': {
+            'history': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': ACCOUNT_SCHEMA_PROPERTIES,
+                    'required': ACCOUNT_SCHEMA_REQUIRED,
+                },
+            },
+        },
+        'required': [
+            'history'
+        ],
+    }
+
+    schema = json_response_schema(page_schema)
+
+    try:
+        resp = proxy.get_account_history(address, page)
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+    except ValidationError as e:
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+
+    return resp['history']
 
 
 def get_all_names_page(offset, count, include_expired=False, hostport=None, proxy=None):
@@ -1105,7 +1718,7 @@ def get_all_names_page(offset, count, include_expired=False, hostport=None, prox
         if BLOCKSTACK_DEBUG:
             log.exception(ae)
 
-        return {'error': 'Invalid page'}
+        return {'error': 'Invalid page', 'http_status': 400}
 
     resp = {}
     try:
@@ -1125,12 +1738,24 @@ def get_all_names_page(offset, count, include_expired=False, hostport=None, prox
                 log.error('Invalid name "{}"'.format(str(n)))
             else:
                 valid_names.append(n)
-        resp['names'] = valid_names
-    except (ValidationError, AssertionError) as e:
-        if BLOCKSTACK_DEBUG:
-            log.exception(e)
 
-        resp = json_traceback(resp.get('error'))
+        resp['names'] = valid_names
+
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+        
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1138,7 +1763,7 @@ def get_all_names_page(offset, count, include_expired=False, hostport=None, prox
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['names']
@@ -1178,12 +1803,22 @@ def get_num_names(include_expired=False, proxy=None, hostport=None):
         resp = json_validate(count_schema, resp)
         if json_is_error(resp):
             return resp
+
     except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1191,10 +1826,138 @@ def get_num_names(include_expired=False, proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['count']
+
+
+def get_num_subdomains(proxy=None, hostport=None):
+    """
+    Get the number of subdomains registered
+    Return integer count on success
+    Return {'error': ...} on failure
+    """
+    assert proxy or hostport, 'Need proxy or hostport'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    count_schema = {
+        'type': 'object',
+        'properties': {
+            'count': {
+                'type': 'integer',
+                'minimum': 0
+            },
+        },
+        'required': [
+            'count'
+        ]
+    }
+
+    schema = json_response_schema(count_schema)
+
+    try:
+        resp = proxy.get_num_subdomains()
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+
+    return resp['count']
+
+
+def get_all_subdomains(offset=0, count=100, proxy=None, hostport=None):
+    """
+    Get all subdomains within the given range.
+    Return the list of names on success
+    Return {'error': ...} on failure
+    """
+    assert proxy or hostport, 'Need proxy or hostport'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    offset = int(offset)
+    count = int(count)
+
+    page_schema = {
+        'type': 'object',
+        'properties': {
+            'names': {
+                'type': 'array',
+                'items': {
+                    'type': 'string',
+                    'uniqueItems': True
+                },
+            },
+        },
+        'required': [
+            'names',
+        ],
+    }
+
+    schema = json_response_schema(page_schema)
+
+    try:
+        resp = proxy.get_all_subdomains(offset, count)
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+        for name in resp['names']:
+            if not is_subdomain(str(name)):
+                raise ValidationError('Not a valid subdomain: {}'.format(str(name)))
+
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+
+    return resp['names']
 
 
 def get_all_names(offset=None, count=None, include_expired=False, proxy=None, hostport=None):
@@ -1233,7 +1996,7 @@ def get_all_names(offset=None, count=None, include_expired=False, proxy=None, ho
         if len(page) > request_size:
             # error
             error_str = 'server replied too much data'
-            return {'error': error_str}
+            return {'error': error_str, 'http_status': 503}
         elif len(page) == 0:
             # end-of-table
             break
@@ -1281,12 +2044,22 @@ def get_all_namespaces(offset=None, count=None, proxy=None, hostport=None):
         resp = json_validate(namespaces_schema, resp)
         if json_is_error(resp):
             return resp
+
     except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1294,7 +2067,7 @@ def get_all_namespaces(offset=None, count=None, proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     stride = len(resp['namespaces']) if count is None else offset + count
@@ -1344,13 +2117,24 @@ def get_names_in_namespace_page(namespace_id, offset, count, proxy=None, hostpor
                 log.error('Invalid name "{}"'.format(str(n)))
             else:
                 valid_names.append(n)
+
         return valid_names
-    except (ValidationError, AssertionError) as e:
+
+    except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1358,7 +2142,7 @@ def get_names_in_namespace_page(namespace_id, offset, count, proxy=None, hostpor
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
 
@@ -1397,8 +2181,17 @@ def get_num_names_in_namespace(namespace_id, proxy=None, hostport=None):
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1406,7 +2199,7 @@ def get_num_names_in_namespace(namespace_id, proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['count']
@@ -1446,7 +2239,7 @@ def get_names_in_namespace(namespace_id, offset=None, count=None, proxy=None, ho
         if len(page) > request_size:
             # error
             error_str = 'server replied too much data'
-            return {'error': error_str}
+            return {'error': error_str, 'http_status': 503}
         elif len(page) == 0:
             # end-of-table
             break
@@ -1494,12 +2287,29 @@ def get_names_owned_by_address(address, proxy=None, hostport=None):
         # names must be valid
         for n in resp['names']:
             assert is_name_valid(str(n)), ('Invalid name "{}"'.format(str(n)))
-    except (ValidationError, AssertionError) as e:
+
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except AssertionError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Got an invalid name from the server'}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1507,7 +2317,7 @@ def get_names_owned_by_address(address, proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['names']
@@ -1552,12 +2362,28 @@ def get_subdomains_owned_by_address(address, proxy=None, hostport=None):
         for n in resp['subdomains']:
             assert is_subdomain(str(n)), ('Invalid subdomain "{}"'.format(str(n)))
 
-    except (ValidationError, AssertionError) as e:
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except AssertionError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response included an invalid subdomain', 'http_status': 500}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1565,10 +2391,83 @@ def get_subdomains_owned_by_address(address, proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['subdomains']
+
+
+def get_subdomain_ops_at_txid(txid, proxy=None, hostport=None):
+    """
+    Get the list of subdomain operations added by a txid
+    Returns the list of operations ([{...}]) on success
+    Returns {'error': ...} on failure
+    """
+    assert proxy or hostport, 'Need proxy or hostport'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    subdomain_ops_schema = {
+        'type': 'object',
+        'properties': {
+            'subdomain_ops': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': OP_HISTORY_SCHEMA['properties'],
+                    'required': SUBDOMAIN_HISTORY_REQUIRED,
+                },
+            },
+        },
+        'required': ['subdomain_ops'],
+    }
+
+    schema = json_response_schema(subdomain_ops_schema)
+
+    resp = {}
+    try:
+        resp = proxy.get_subdomain_ops_at_txid(txid)
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+        # names must be valid
+        for op in resp['subdomain_ops']:
+            assert is_subdomain(str(op['fully_qualified_subdomain'])), ('Invalid subdomain "{}"'.format(op['fully_qualified_subdomain']))
+
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except AssertionError as e:
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response included an invalid subdomain', 'http_status': 500}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+
+    return resp['subdomain_ops']
 
 
 def get_name_DID(name, proxy=None, hostport=None):
@@ -1602,12 +2501,28 @@ def get_name_DID(name, proxy=None, hostport=None):
         # DID must be well-formed
         assert parse_DID(resp['did'])
 
-    except (ValidationError, AssertionError) as e:
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+    
+    except AssertionError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server replied an unparseable DID'}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1615,7 +2530,7 @@ def get_name_DID(name, proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['did']
@@ -1682,12 +2597,21 @@ def get_DID_record(did, proxy=None, hostport=None):
         if json_is_error(resp):
             return resp
 
-    except (ValidationError, AssertionError) as e:
+    except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(e))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1695,7 +2619,7 @@ def get_DID_record(did, proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     final_name_state = resp['record']
@@ -1745,8 +2669,22 @@ def get_consensus_at(block_height, proxy=None, hostport=None):
         resp = json_validate(resp_schema, resp)
         if json_is_error(resp):
             return resp
-    except (ValidationError, AssertionError) as e:
-        resp = json_traceback(resp.get('error'))
+
+    except ValidationError as ve:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ve)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1754,12 +2692,12 @@ def get_consensus_at(block_height, proxy=None, hostport=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     if resp['consensus'] is None:
         # node hasn't processed this block 
-        return {'error': 'The node has not processed block {}'.format(block_height)}
+        return {'error': 'The node has not processed block {}'.format(block_height), 'http_status': 503}
 
     return resp['consensus']
 
@@ -1818,21 +2756,34 @@ def get_blockstack_transactions_at(block_id, proxy=None, hostport=None):
     # how many nameops?
     num_nameops = None
     try:
-        num_nameops = proxy.get_num_nameops_at(block_id)
+        num_nameops = proxy.get_num_blockstack_ops_at(block_id)
         num_nameops = json_validate(count_schema, num_nameops)
         if json_is_error(num_nameops):
             return num_nameops
 
     except ValidationError as e:
-        num_nameops = json_traceback()
-        return num_nameops
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
 
     except Exception as ee:
         if BLOCKSTACK_DEBUG:
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     num_nameops = num_nameops['count']
@@ -1843,13 +2794,13 @@ def get_blockstack_transactions_at(block_id, proxy=None, hostport=None):
     while len(all_nameops) < num_nameops:
         resp = {}
         try:
-            resp = proxy.get_nameops_at(block_id, len(all_nameops), page_size)
+            resp = proxy.get_blockstack_ops_at(block_id, len(all_nameops), page_size)
             resp = json_validate(nameop_schema, resp)
             if json_is_error(resp):
                 return resp
 
             if len(resp['nameops']) == 0:
-                return {'error': 'Got zero-length nameops reply'}
+                return {'error': 'Got zero-length nameops reply', 'http_status': 503}
 
             all_nameops += resp['nameops']
 
@@ -1857,14 +2808,25 @@ def get_blockstack_transactions_at(block_id, proxy=None, hostport=None):
             if BLOCKSTACK_DEBUG:
                 log.exception(e)
 
-            resp = json_traceback(resp.get('error'))
+            resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
             return resp
+
+        except socket.timeout:
+            log.error("Connection timed out")
+            resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+            return resp
+
+        except socket.error as se:
+            log.error("Connection error {}".format(se.errno))
+            resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+            return resp
+
         except Exception as ee:
             if BLOCKSTACK_DEBUG:
                 log.exception(ee)
 
             log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-            resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+            resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
             return resp
 
     return all_nameops
@@ -1907,12 +2869,22 @@ def get_consensus_hashes(block_heights, hostport=None, proxy=None):
         if json_is_error(resp):
             log.error('Failed to get consensus hashes for {}: {}'.format(block_heights, resp['error']))
             return resp
+
     except ValidationError as e:
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -1920,7 +2892,7 @@ def get_consensus_hashes(block_heights, hostport=None, proxy=None):
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     consensus_hashes = resp['consensus_hashes']
@@ -1934,7 +2906,7 @@ def get_consensus_hashes(block_heights, hostport=None, proxy=None):
         log.debug('consensus hashes: {}'.format(ret))
         return ret
     except ValueError:
-        return {'error': 'Invalid data: expected int'}
+        return {'error': 'Server returned invalid data: expected int', 'http_status': 503}
 
 
 def get_block_from_consensus(consensus_hash, hostport=None, proxy=None):
@@ -1980,57 +2952,101 @@ def get_block_from_consensus(consensus_hash, hostport=None, proxy=None):
         if BLOCKSTACK_DEBUG:
             log.exception(ve)
 
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
         return resp
     
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
     except Exception as ee:
         if BLOCKSTACK_DEBUG:
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['block_id']
 
 
-def get_name_history_blocks(name, hostport=None, proxy=None):
+def get_name_history_page(name, page, hostport=None, proxy=None):
     """
-    Get the list of blocks at which this name was affected.
-    Returns the list of blocks on success, including if the name doesn't exist (in which case the list will be empty)
+    Get a page of the name's history
+    Returns {'status': True, 'history': ..., 'indexing': ..., 'lastblock': ...} on success
     Returns {'error': ...} on error
     """
     assert hostport or proxy, 'Need hostport or proxy'
     if proxy is None:
         proxy = connect_hostport(hostport)
 
+    name_required = ['op', 'opcode', 'txid', 'vtxindex']
+    subdomain_required = ['txid']
+    required = None
+    if check_subdomain(name):
+        log.debug('Subdomain: {}'.format(name))
+        required = subdomain_required
+    else:
+        log.debug('Name: {}'.format(name))
+        required = name_required
+
     hist_schema = {
-        'type': 'array',
-        'items': {
-            'type': 'integer',
-            'minimum': 0,
+        'type': 'object',
+        'patternProperties': {
+            '^[0-9]+$': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': OP_HISTORY_SCHEMA['properties'],
+                    'required': required
+                },
+            },
         },
     }
 
-    hist_list_schema = {
+    hist_resp_schema = {
         'type': 'object',
         'properties': {
-            'history_blocks': hist_schema
+            'history': hist_schema,
         },
-        'required': [
-            'history_blocks'
-        ],
+        'required': [ 'history' ],
     }
 
-    resp_schema = json_response_schema( hist_list_schema )
+    resp_schema = json_response_schema(hist_resp_schema)
     resp = {}
+    lastblock = None
+    indexin = None
+
     try:
-        resp = proxy.get_name_history_blocks(name)
-        resp = json_validate(resp_schema, resp)
+        _resp = proxy.get_name_history_page(name, page)
+        resp = json_validate(resp_schema, _resp)
         if json_is_error(resp):
             return resp
+
+        lastblock = _resp['lastblock']
+        indexing = _resp['indexing']
+
     except ValidationError as e:
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
         resp = json_traceback(resp.get('error'))
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -2041,7 +3057,211 @@ def get_name_history_blocks(name, hostport=None, proxy=None):
         resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
         return resp
 
-    return resp['history_blocks']
+    return {'status': True, 'history': resp['history'], 'lastblock': lastblock, 'indexing': indexing}
+
+
+def name_history_merge(h1, h2):
+    """
+    Given two name histories (grouped by block), merge them.
+    """
+    ret = {}
+    blocks_1 = [int(b) for b in h1.keys()]
+    blocks_2 = [int(b) for b in h2.keys()]
+
+    # find overlapping blocks
+    overlap = list(set(blocks_1).intersection(set(blocks_2)))
+    if len(overlap) > 0:
+        for b in overlap:
+            h = h1[str(b)] + h2[str(b)]
+            h.sort(lambda v1, v2: -1 if v1['vtxindex'] < v2['vtxindex'] else 1)
+            
+            uniq = []
+            last_vtxindex = None
+            for i in range(0, len(h)):
+                if h[i]['vtxindex'] != last_vtxindex:
+                    uniq.append(h[i])
+                    last_vtxindex = h[i]['vtxindex']
+                
+            ret[str(b)] = uniq
+    
+    all_blocks = list(set(blocks_1 + blocks_2))
+    for b in all_blocks:
+        if b in overlap:
+            continue
+
+        if b in blocks_1:
+            ret[str(b)] = h1[str(b)]
+        else:
+            ret[str(b)] = h2[str(b)]
+
+    return ret
+    
+
+def get_name_history(name, hostport=None, proxy=None, history_page=None):
+    """
+    Get the full history of a name
+    Returns {'status': True, 'history': ...} on success, where history is grouped by block
+    Returns {'error': ...} on error
+    """
+    assert hostport or proxy, 'Need hostport or proxy'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    hist = {}
+    indexing = None
+    lastblock = None
+
+    if history_page != None:
+        resp = get_name_history_page(name, history_page, proxy=proxy)
+        if 'error' in resp:
+            return resp
+
+        indexing = resp['indexing']
+        lastblock = resp['lastblock']
+
+        return {'status': True, 'history': resp['history'], 'indexing': indexing, 'lastblock': lastblock}
+
+    for i in range(0, 100000000):       # this is obviously too big
+        resp = get_name_history_page(name, i, proxy=proxy)
+        if 'error' in resp:
+            return resp
+
+        indexing = resp['indexing']
+        lastblock = resp['lastblock']
+
+        if len(resp['history']) == 0:
+            # caught up 
+            break
+
+        hist = name_history_merge(hist, resp['history'])
+
+    return {'status': True, 'history': hist, 'indexing': indexing, 'lastblock': lastblock}
+
+
+def get_name_and_history(name, include_expired=False, include_grace=True, hostport=None, proxy=None, history_page=None):
+    """
+    Get the current name record and its history
+    (this is a replacement for proxy.get_name_blockchain_record())
+    Return {'status': True, 'record': ...} on success, where .record.history is defined as {block_height: [{history}, {history}, ...], ...}
+    Return {'error': ...} on error
+    """
+    assert hostport or proxy, 'Need hostport or proxy'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    hist = get_name_history(name, proxy=proxy, history_page=history_page)
+    if 'error' in hist:
+        return hist
+
+    # just the name
+    rec = get_name_record(name, include_history=False, include_expired=include_expired, include_grace=include_grace, proxy=proxy)
+    if 'error' in rec:
+        return rec
+
+    rec['history'] = hist['history']
+    return {'status': True, 'record': rec, 'lastblock': hist['lastblock'], 'indexing': hist['indexing']}
+
+
+def name_history_merge(h1, h2):
+    """
+    Given two name histories (grouped by block), merge them.
+    """
+    ret = {}
+    blocks_1 = [int(b) for b in h1.keys()]
+    blocks_2 = [int(b) for b in h2.keys()]
+
+    # find overlapping blocks
+    overlap = list(set(blocks_1).intersection(set(blocks_2)))
+    if len(overlap) > 0:
+        for b in overlap:
+            h = h1[str(b)] + h2[str(b)]
+            h.sort(lambda v1, v2: -1 if v1['vtxindex'] < v2['vtxindex'] else 1)
+            
+            uniq = []
+            last_vtxindex = None
+            for i in range(0, len(h)):
+                if h[i]['vtxindex'] != last_vtxindex:
+                    uniq.append(h[i])
+                    last_vtxindex = h[i]['vtxindex']
+                
+            ret[str(b)] = uniq
+    
+    all_blocks = list(set(blocks_1 + blocks_2))
+    for b in all_blocks:
+        if b in overlap:
+            continue
+
+        if b in blocks_1:
+            ret[str(b)] = h1[str(b)]
+        else:
+            ret[str(b)] = h2[str(b)]
+
+    return ret
+    
+
+def get_name_history(name, hostport=None, proxy=None, history_page=None):
+    """
+    Get the full history of a name
+    Returns {'status': True, 'history': ...} on success, where history is grouped by block
+    Returns {'error': ...} on error
+    """
+    assert hostport or proxy, 'Need hostport or proxy'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    hist = {}
+    indexing = None
+    lastblock = None
+
+    if history_page != None:
+        resp = get_name_history_page(name, history_page, proxy=proxy)
+        if 'error' in resp:
+            return resp
+
+        indexing = resp['indexing']
+        lastblock = resp['lastblock']
+
+        return {'status': True, 'history': resp['history'], 'indexing': indexing, 'lastblock': lastblock}
+
+    for i in range(0, 10000):       # this is obviously too big
+        resp = get_name_history_page(name, i, proxy=proxy)
+        if 'error' in resp:
+            return resp
+
+        indexing = resp['indexing']
+        lastblock = resp['lastblock']
+
+        if len(resp['history']) == 0:
+            # caught up 
+            break
+
+        hist = name_history_merge(hist, resp['history'])
+
+    return {'status': True, 'history': hist, 'indexing': indexing, 'lastblock': lastblock}
+
+
+def get_name_and_history(name, include_expired=False, include_grace=True, hostport=None, proxy=None, history_page=None):
+    """
+    Get the current name record and its history
+    (this is a replacement for proxy.get_name_blockchain_record())
+    Return {'status': True, 'record': ...} on success, where .record.history is defined as {block_height: [{history}, {history}, ...], ...}
+    Return {'error': ...} on error
+    """
+    assert hostport or proxy, 'Need hostport or proxy'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    hist = get_name_history(name, proxy=proxy, history_page=history_page)
+    if 'error' in hist:
+        return hist
+
+    # just the name
+    rec = get_name_record(name, include_history=False, include_expired=include_expired, include_grace=include_grace, proxy=proxy)
+    if 'error' in rec:
+        return rec
+
+    rec['history'] = hist['history']
+    return {'status': True, 'record': rec, 'lastblock': hist['lastblock'], 'indexing': hist['indexing']}
 
 
 def get_name_at(name, block_id, include_expired=False, hostport=None, proxy=None):
@@ -2098,7 +3318,17 @@ def get_name_at(name, block_id, include_expired=False, hostport=None, proxy=None
         if BLOCKSTACK_DEBUG:
             log.exception(e)
 
-        resp = json_traceback(resp.get('error'))
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
         return resp
 
     except Exception as ee:
@@ -2106,13 +3336,13 @@ def get_name_at(name, block_id, include_expired=False, hostport=None, proxy=None
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['records']
 
 
-def get_nameops_hash_at(block_id, hostport=None, proxy=None):
+def get_blockstack_ops_hash_at(block_id, hostport=None, proxy=None):
     """
     Get the hash of a set of records as they were at a particular block.
     Return the hash on success.
@@ -2138,22 +3368,93 @@ def get_nameops_hash_at(block_id, hostport=None, proxy=None):
     schema = json_response_schema( hash_schema )
     resp = {}
     try:
-        resp = proxy.get_nameops_hash_at(block_id)
+        resp = proxy.get_blockstack_ops_hash_at(block_id)
         resp = json_validate(schema, resp)
         if json_is_error(resp):
             return resp
+
     except ValidationError as e:
-        resp = json_traceback(resp.get('error'))
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
         return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
     except Exception as ee:
         if BLOCKSTACK_DEBUG:
             log.exception(ee)
 
         log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
-        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.'}
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
         return resp
 
     return resp['ops_hash']
+
+
+def is_name_zonefile_hash(name, zonefile_hash, hostport=None, proxy=None):
+    """
+    Determine if a name set a given zone file hash.
+    Return {'result': True/False} if so
+    Return {'error': ...} on error
+    """
+    assert hostport or proxy, 'Need hostport or proxy'
+    if proxy is None:
+        proxy = connect_hostport(hostport)
+
+    zonefile_check_schema = {
+        'type': 'object',
+        'properties': {
+            'result': {
+                'type': 'boolean'
+            }
+        },
+        'required': [ 'result' ]
+    }
+
+    schema = json_response_schema(zonefile_check_schema)
+    resp = {}
+    try:
+        resp = proxy.is_name_zonefile_hash(name, zonefile_hash)
+        resp = json_validate(schema, resp)
+        if json_is_error(resp):
+            return resp
+
+    except ValidationError as e:
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        resp = {'error': 'Server response did not match expected schema.  You are likely communicating with an out-of-date Blockstack node.', 'http_status': 502}
+        return resp
+
+    except socket.timeout:
+        log.error("Connection timed out")
+        resp = {'error': 'Connection to remote host timed out.', 'http_status': 503}
+        return resp
+
+    except socket.error as se:
+        log.error("Connection error {}".format(se.errno))
+        resp = {'error': 'Connection to remote host failed.', 'http_status': 502}
+        return resp
+
+    except Exception as ee:
+        if BLOCKSTACK_DEBUG:
+            log.exception(ee)
+
+        log.error("Caught exception while connecting to Blockstack node: {}".format(ee))
+        resp = {'error': 'Failed to contact Blockstack node.  Try again with `--debug`.', 'http_status': 500}
+        return resp
+
+    return {'result': resp['result']}
 
 
 def get_JWT(url, address=None):
@@ -2191,6 +3492,7 @@ def get_JWT(url, address=None):
             resp = requests.get(url)
             assert resp.status_code == 200, 'Bad status code on {}: {}'.format(url, resp.status_code)
             jwt_txt = resp.text
+
         except Exception as e:
             if BLOCKSTACK_TEST:
                 log.exception(e)
@@ -2225,6 +3527,7 @@ def get_JWT(url, address=None):
         assert isinstance(jwt['payload']['issuer'], dict)
         assert 'publicKey' in jwt['payload']['issuer'], jwt
         assert virtualchain.ecdsalib.ecdsa_public_key(str(jwt['payload']['issuer']['publicKey']))
+
     except AssertionError as ae:
         if BLOCKSTACK_TEST or BLOCKSTACK_DEBUG:
             log.exception(ae)
@@ -2251,7 +3554,7 @@ def get_JWT(url, address=None):
     return jwt
 
 
-def resolve_profile(name, hostport=None, proxy=None):
+def resolve_profile(name, include_expired=False, include_name_record=False, hostport=None, proxy=None):
     """
     Resolve a name to its profile.
     This is a multi-step process:
@@ -2261,29 +3564,29 @@ def resolve_profile(name, hostport=None, proxy=None):
     4. fetch and authenticate the JWT at each URL (abort if there are none)
     5. extract the profile JSON and return that, along with the zone file and public key
 
-    Return {'profile': ..., 'zonefile': ..., 'public_key': ...} on success
+    Return {'profile': ..., 'zonefile': ..., 'public_key': ...['name_rec': ...]} on success
     Return {'error': ...} on error
     """
     assert hostport or proxy, 'Need hostport or proxy'
     
-    name_rec = get_name_record(name, include_history=False, include_expired=False, include_grace=False, proxy=proxy, hostport=hostport)
+    name_rec = get_name_record(name, include_history=False, include_expired=include_expired, include_grace=False, proxy=proxy, hostport=hostport)
     if 'error' in name_rec:
         log.error("Failed to get name record for {}: {}".format(name, name_rec['error']))
-        return {'error': 'Failed to get name record: {}'.format(name_rec['error'])}
+        return {'error': 'Failed to get name record: {}'.format(name_rec['error']), 'http_status': name_rec.get('http_status', 500)}
    
     if 'grace_period' in name_rec and name_rec['grace_period']:
         log.error("Name {} is in the grace period".format(name))
-        return {'error': 'Name {} is not yet expired, but is in the renewal grace period.'.format(name)}
+        return {'error': 'Name {} is not yet expired, but is in the renewal grace period.'.format(name), 'http_status': name_rec.get('http_status', 404)}
         
     if 'value_hash' not in name_rec:
         log.error("Name record for {} has no zone file hash".format(name))
-        return {'error': 'No zone file hash in name record for {}'.format(name)}
+        return {'error': 'No zone file hash in name record for {}'.format(name), 'http_status': 404}
 
     zonefile_hash = name_rec['value_hash']
     zonefile_res = get_zonefiles(hostport, [zonefile_hash], proxy=proxy)
     if 'error' in zonefile_res:
         log.error("Failed to get zone file for {} for name {}: {}".format(zonefile_hash, name, zonefile_res['error']))
-        return {'error': 'Failed to get zone file for {}'.format(name)}
+        return {'error': 'Failed to get zone file for {}'.format(name), 'http_status': 404}
 
     zonefile_txt = zonefile_res['zonefiles'][zonefile_hash]
     log.debug("Got {}-byte zone file {}".format(len(zonefile_txt), zonefile_hash))
@@ -2293,13 +3596,13 @@ def resolve_profile(name, hostport=None, proxy=None):
         zonefile_data = dict(zonefile_data)
         assert 'uri' in zonefile_data
         if len(zonefile_data['uri']) == 0:
-            return {'error': 'No URI records in zone file {} for {}'.format(zonefile_hash, name)}
+            return {'error': 'No URI records in zone file {} for {}'.format(zonefile_hash, name), 'http_status': 404}
 
     except Exception as e:
         if BLOCKSTACK_TEST:
             log.exception(e)
 
-        return {'error': 'Failed to parse zone file {} for {}'.format(zonefile_hash, name)}
+        return {'error': 'Failed to parse zone file {} for {}'.format(zonefile_hash, name), 'http_status': 404}
 
     urls = [uri['target'] for uri in zonefile_data['uri']]
     for url in urls:
@@ -2316,15 +3619,28 @@ def resolve_profile(name, hostport=None, proxy=None):
         profile_data = jwt['payload']['claim']
         public_key = str(jwt['payload']['issuer']['publicKey'])
 
+        # return public key that matches address 
+        pubkeys = [virtualchain.ecdsalib.ecdsa_public_key(keylib.key_formatting.decompress(public_key)),
+                   virtualchain.ecdsalib.ecdsa_public_key(keylib.key_formatting.compress(public_key))]
+
+        if name_rec['address'] == pubkeys[0].address():
+            public_key = pubkeys[0].to_hex()
+        else:
+            public_key = pubkeys[1].to_hex()
+
         ret = {
             'profile': profile_data,
             'zonefile': zonefile_txt,
             'public_key': public_key,
         }
+
+        if include_name_record:
+            ret['name_record'] = name_rec
+
         return ret
 
     log.error("No zone file URLs resolved to a JWT with the public key whose address is {}".format(name_rec['address']))
-    return {'error': 'No profile found for this name'}
+    return {'error': 'No profile found for this name', 'http_status': 404}
 
 
 def resolve_DID(did, hostport=None, proxy=None):
@@ -2337,7 +3653,7 @@ def resolve_DID(did, hostport=None, proxy=None):
     4. fetch and authenticate the JWT at each URL (abort if there are none)
     5. extract the public key from the JWT and return that.
 
-    Return {'public_key': ...} on success
+    Return {'public_key': ..., 'document': ...} on success
     Return {'error': ...} on error
     """
     assert hostport or proxy, 'Need hostport or proxy'
@@ -2345,17 +3661,17 @@ def resolve_DID(did, hostport=None, proxy=None):
     did_rec = get_DID_record(did, hostport=hostport, proxy=proxy)
     if 'error' in did_rec:
         log.error("Failed to get DID record for {}: {}".format(did, did_rec['error']))
-        return {'error': 'Failed to get DID record: {}'.format(did_rec['error'])}
+        return {'error': 'Failed to get DID record: {}'.format(did_rec['error']), 'http_status': did_rec.get('http_status', 500)}
     
     if 'value_hash' not in did_rec:
         log.error("DID record for {} has no zone file hash".format(did))
-        return {'error': 'No zone file hash in name record for {}'.format(did)}
+        return {'error': 'No zone file hash in name record for {}'.format(did), 'http_status': 404}
 
     zonefile_hash = did_rec['value_hash']
     zonefile_res = get_zonefiles(hostport, [zonefile_hash], proxy=proxy)
     if 'error' in zonefile_res:
         log.error("Failed to get zone file for {} for DID {}: {}".format(zonefile_hash, did, zonefile_res['error']))
-        return {'error': 'Failed to get zone file for {}'.format(did)}
+        return {'error': 'Failed to get zone file for {}'.format(did), 'http_status': 404}
 
     zonefile_txt = zonefile_res['zonefiles'][zonefile_hash]
     log.debug("Got {}-byte zone file {}".format(len(zonefile_txt), zonefile_hash))
@@ -2365,13 +3681,13 @@ def resolve_DID(did, hostport=None, proxy=None):
         zonefile_data = dict(zonefile_data)
         assert 'uri' in zonefile_data
         if len(zonefile_data['uri']) == 0:
-            return {'error': 'No URI records in zone file {} for {}'.format(zonefile_hash, did)}
+            return {'error': 'No URI records in zone file {} for {}'.format(zonefile_hash, did), 'http_status': 404}
 
     except Exception as e:
         if BLOCKSTACK_TEST:
             log.exception(e)
 
-        return {'error': 'Failed to parse zone file {} for {}'.format(zonefile_hash, did)}
+        return {'error': 'Failed to parse zone file {} for {}'.format(zonefile_hash, did), 'http_status': 404}
 
     urls = [uri['target'] for uri in zonefile_data['uri']]
     for url in urls:
@@ -2379,10 +3695,82 @@ def resolve_DID(did, hostport=None, proxy=None):
         if not jwt:
             continue
 
+        if 'payload' not in jwt:
+            log.error('Invalid JWT at {}: no payload'.format(url))
+            continue
+
+        if 'issuer' not in jwt['payload']:
+            log.error('Invalid JWT at {}: no issuer'.format(url))
+            continue
+
+        if 'publicKey' not in jwt['payload']['issuer']:
+            log.error('Invalid JWT at {}: no public key'.format(url))
+            continue
+
+        if 'claim' not in jwt['payload']:
+            log.error('Invalid JWT at {}: no claim'.format(url))
+            continue
+
+        if not isinstance(jwt['payload'], dict):
+            log.error('Invalid JWT at {}: claim is malformed'.format(url))
+            continue
+
         # found!
         public_key = str(jwt['payload']['issuer']['publicKey'])
-        return {'public_key': public_key}
+        document = jwt['payload']['claim']
+
+        # make sure it's a well-formed DID
+        document['@context'] = 'https://w3id.org/did/v1'
+        document['publicKey'] = [
+            {
+                'id': did,
+                'type': 'secp256k1',
+                'publicKeyHex': public_key
+            }
+        ]
+
+        return {'public_key': public_key, 'document': document}
 
     log.error("No zone file URLs resolved to a JWT with the public key whose address is {}".format(did_rec['address']))
-    return {'error': 'No public key found for the given DID'}
+    return {'error': 'No public key found for the given DID', 'http_status': 404}
 
+
+def decode_name_zonefile(name, zonefile_txt):
+    """
+    Decode a zone file for a name.
+    Must be either a well-formed DNS zone file, or a legacy Onename profile.
+    Return None on error
+    """
+
+    user_zonefile = None
+    try:
+        # by default, it's a zonefile-formatted text file
+        user_zonefile_defaultdict = blockstack_zones.parse_zone_file(zonefile_txt)
+
+        # force dict
+        user_zonefile = dict(user_zonefile_defaultdict)
+
+    except (IndexError, ValueError, blockstack_zones.InvalidLineException):
+        # might be legacy profile
+        log.debug('WARN: failed to parse user zonefile; trying to import as legacy')
+        try:
+            user_zonefile = json.loads(zonefile_txt)
+            if not isinstance(user_zonefile, dict):
+                log.debug('Not a legacy user zonefile')
+                return None
+
+        except Exception as e:
+            log.error('Failed to parse non-standard zonefile')
+            return None
+
+    except Exception as e:
+        if BLOCKSTACK_DEBUG:
+            log.exception(e)
+
+        log.error('Failed to parse zonefile')
+        return None
+
+    if user_zonefile is None:
+        return None 
+
+    return user_zonefile

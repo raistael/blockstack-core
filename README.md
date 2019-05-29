@@ -14,15 +14,16 @@ If you are looking to get started with Blockstack applications, we recommend you
 - [What is Blockstack Core?](#what-is-blockstack-core)
 - [Installing Blockstack Core](#installing-blockstack-core)
 - [Running a Blockstack Core Node](#running-a-blockstack-core-node)
-- [Development Status](#development-status)
-- [Blockstack Docs](#blockstack-docs)
-- [Contributing](#contributing)
-- [Further Information](#further-information)
+- [Using Blockstack Core](#using-blockstack-core)
+- [Troubleshooting](#troubleshooting)
+- [Developer Resources](#developer-resources)
+- [Community](#community)
+- [Further Information](#further-reading)
 - [Copyright and License](#copyright-and-license)
 
 ## What is Blockstack?
 
-Blockstack is a new internet for decentralized apps where users own their data.
+Blockstack is a network for decentralized apps where users own their data.
 
 Blockstack applications follow a **can't-be-evil** design
 philosophy.  They *cannot* alter, transfer, or revoke the user's identity, and
@@ -34,15 +35,16 @@ immediately transferrable to Blockstack.
 
 Blockstack applications look and feel like traditional Web applications.
 Under the hood they use Blockstack APIs for user authentication and storage.
-Blockstack handles user authentication using the **Blockstack Naming Service**
-(BNS), a decentralized DNS/PKI system for user names built on top of the Bitcoin
-blockchain.  It handles storage using **Gaia**, a scalable decentralized
+Blockstack handles user authentication using the [Blockstack Naming
+Service](docs/blockstack_naming_service.md)
+(BNS), a decentralized naming and public key infrastructure built on top of the Bitcoin
+blockchain.  It handles storage using [Gaia](https://github.com/blockstack/gaia), a scalable decentralized
 key/value storage system that looks and feels like `localStorage`,
 but lets users securely store and share application data
-via existing storage systems like Dropbox or S3.
+via user-selected storage systems.
 
 Blockstack applications differ from traditional Web applications in two key
-ways.  First, **users own their identities**.  
+ways.  First, **users own their identities**.
 The [Blockstack Browser](https://github.com/blockstack/blockstack-browser)
 gives users direct control over their private keys and profile data,
 and fulfills the role of a SSO provider to Blockstack apps.
@@ -76,8 +78,8 @@ integrate into existing Web apps.
 
 ## What is Blockstack Core?
 
-Blockstack Core implements BNS and the storage routing system for Gaia (called
-**Atlas**).  Blockstack Core
+Blockstack Core implements BNS and [Atlas](docs/atlas_network.md), the storage
+routing system for Gaia.  Blockstack Core
 nodes form the backbone of the Blockstack network.  Each node indexes the
 Bitcoin blockchain and maintains a full replica of all names,
 public keys, and storage routing information.  This makes the Blockstack network
@@ -92,13 +94,6 @@ Core nodes, so it will keep serving names, public keys, and storage routes even
 if upstream nodes are unreachable or go offline.
 
 ## Installing Blockstack Core
-
-There are two parts to Blockstack Core:  a background network daemon that talks
-with the rest of the network and builds up the local BNS and storage routing state
-(`blockstack-core`), and
-an API shim that provides a stable, RESTful API that facilitates name and
-storage routing lookups and registrations (`blockstack api`).  Both are
-installed by default.
 
 There are three supported methods to install Blockstack Core:
 - [`source`](#install-from-source)
@@ -127,6 +122,8 @@ install Blockstack Core in a non-system directory.
 
 ### Install with `pip`
 
+**NOTE:** Using `pip` is only supported for stable releases (i.e. `master`).
+
 Blockstack is built against Python 2.7.  You should use `pip2` if you have it instead of `pip`.  If you do not have `pip2`, you should verify that your `pip` is configured for Python 2.
 
 On Mac:
@@ -134,6 +131,28 @@ On Mac:
 ```bash
 # Install blockstack
 $ pip install blockstack --upgrade
+```
+On CentOS 7 & RHEL:
+
+```
+# Install dependencies
+$ yum install epel-release
+$ yum install python-pip python-devel openssl-devel libffi-devel rng-tools gmp-devel zlib-devel
+
+# Install blockstack
+$ sudo pip install blockstack --upgrade
+```
+
+You will need to open ports TCP:6264 and TCP:6270.  If you have trouble starting
+`blockstack-core`, you can try disabling SELinux and/or `firewalld` as follows:
+
+```bash
+# Disable SELinux
+$ setenforce 0
+$ sed -i --follow-symlinks 's/^SELINUX=.*/SELINUX=disabled/g' /etc/sysconfig/selinux && cat /etc/sysconfig/selinux
+
+# Stop firewalld
+$ systemctl stop firewalld && systemctl disable firewalld
 ```
 
 On Debian & Ubuntu:
@@ -149,17 +168,37 @@ $ sudo pip install blockstack --upgrade
 
 ### Install with `docker`
 
-TODO
+**NOTE:** Using `docker` is only supported for stable releases (i.e. `master`).
+
+Another way to run `blockstack-core` is through docker. We provide per-commit image builds of this repository that are [available on quay.io](https://quay.io/repository/blockstack/blockstack-core?tab=tags).
+
+```shell
+$ git clone git@github.com:blockstack/blockstack-core.git
+$ cd blockstack-core
+$ docker build -t blockstack-core:master .
+
+# create directory to store Blockstack Core state
+$ export BLOCKSTACK_DIR="/var/blockstack-core-data"
+$ mkdir -p "$BLOCKSTACK_DIR"
+$ docker run \
+   -v $BLOCKSTACK_DIR:/root/.blockstack-server \
+   -p 6264:6264 \
+   -p 6270:6270 \
+   blockstack-core:master
+```
+
+These commands will fast-sync and run a Blockstack Core node in about 10
+minutes.  The state for the Blockstack Core node will be stored to
+`$BLOCKSTACK_DIR`.  You can see the node's logs with `docker logs -f` or with
+`tail -f "$BLOCKSTACK_DIR/blockstack-server.log"`.
+
+Notes:
+- This method is currently only fully supported on Linux.
+- You will need `sudo` access to run the above scripts, and/or be a member of the `docker` group.
+- You can run more than one instance of this setup per host. Allow at least 1 CPU core for each container
+- To configure a different `bitcoind` node, you must edit your `blockstack-server.ini` file before running the `./docker-tools.sh init-*` commands. After `init-*` has been run you must edit the `data/core/server/blockstack-server.ini` to change those settings. 
 
 ## Running a Blockstack Core Node
-
-There are two parts to this:
-- Running a `blockstack-core` daemon to build up a local copy of the Blockstack
-  network state.
-- Running a `blockstack api` daemon to provide a RESTful API endpoint for
-  looking up and registering names.
-
-### Setting up Blockstack Core
 
 Before doing anything, you should configure your Blockstack Core node.
 
@@ -187,7 +226,7 @@ By default, it will pull a snapshot from
 verify its authenticity.  It will populate your `~/.blockstack-server/`
 directory with a recent snapshot of the network state (less than 24 hours old).
 
-To start your Blockstack Core node, you should run 
+To start your Blockstack Core node, you should run
 
 ```bash
 $ blockstack-core --debug start
@@ -199,68 +238,15 @@ any problems you may have.
 
 You can find the node's log in `~/.blockstack-server/blockstack-server.log`.
 
-#### Setting up an API Endpoint
-
-The Blockstack API endpoint provides a convenient RESTful API for interacting
-with the Blockstack network.  It is stable, versioned, and 
-[documented](https://blockstack.github.io/blockstack-core).
-It provides the programmatic interfaces for registering new user names and
-looking up other users' public keys and storage routing information.
-In addition, it is used to implement Web services like
-[core.blockstack.org](https://core.blockstack.org) and
-[explorer.blockstack.org](https://explorer.blockstack.org).
-*Programs that want to interact with Blockstack over the Web should use the
-RESTful API*.
-
-Once you have a `blockstack-core` daemon running somewhere, you can stand up a
-RESTful API endpoint.  This is achieved with the `blockstack` CLI program that comes with Blockstack Core.
-
-First, you will need to set up the API endpoint.  To do so, run:
-
-```
-$ blockstack setup
-```
-
-The `blockstack` program stores its state in `~/.blockstack/`.
-- The configuration file is in `~/.blockstack/client.ini`
-- The log file is in `~/.blockstack/api_endpoint.log`
-- The encrypted wallet file is in `~/.blockstack/wallet.json`
-
-**NOTE:** This will generate a wallet.  *BE SURE TO SAVE THE PASSWORD.*  The
-wallet will be used to *pay for* names.
-
-**Hints**
-
-Most of the default config options are sounds.  However, there are a few to be
-aware of:
-
-* When prompted for a `server` and `port`, fill in the host and port
-number for your `blockstack-core` daemon.  The default port is 6264.
-
-* You will be prompted for a wallet password.  Again, *BE SURE TO SAVE THE WALLET PASSWORD*.  It is used to derive the key that encrypts the wallet on disk.
-
-* Some RESTful API methods require an API password.  This is set in the config
-  file, under `[blockstack_client]` as `api_password`.
-
-Once this step is complete, you will be able to start the API endpoint with:
-
-```
-$ blockstack api start
-```
-
 ## Using Blockstack Core
 
-Once you have Blockstack Core installed, you will have two daemons running:
-* The `blockstack-core` daemon
-* The `blockstack api` daemon
-
-The standard way to interact with Blockstack Core is through the `blockstack api` daemon.  The full documentation for the API endpoints is available [here](https://blockstack.github.io/blockstack-core).  Below are some common examples.
+The standard way to interact with Blockstack Core is through its RESTful interface.  The full documentation for the API endpoints is available [here](https://core.blockstack.org).  Below are some common examples.
 
 To check that your API endpoint is up, you can ping it with:
 
 ```
 $ curl http://localhost:6270/v1/ping
-{"status": "alive", "version": "0.18.0"}
+{"status": "alive", "version": "20.0.0.0"}
 ```
 
 You can confirm that your API endpoint can contact the `blockstack-core` daemon
@@ -271,77 +257,10 @@ $ curl http://localhost:6270/v1/names/muneeb.id
 {"status": "registered", "zonefile": "$ORIGIN muneeb.id\n$TTL 3600\n_http._tcp URI 10 1 \"https://gaia.blockstack.org/hub/1J3PUxY5uDShUnHRrMyU6yKtoHEUPhKULs/0/profile.json\"\n", "expire_block": 599266, "blockchain": "bitcoin", "last_txid": "7e16e8688ca0413a398bbaf16ad4b10d3c9439555fc140f58e5ab4e50793c476", "address": "1J3PUxY5uDShUnHRrMyU6yKtoHEUPhKULs", "zonefile_hash": "37aecf837c6ae9bdc9dbd98a268f263dacd00361"}
 ```
 
-You can stop the API daemon with the following command:
-
-```
-$ blockstack api stop
-```
-
-You can stop the `blockstack-core` daemon with the following command:
+You can stop the Blockstack Core daemon with the following command:
 
 ```
 $ blockstack-core stop
-```
-
-## Using the Blockstack CLI
-
-Please see the [usage docs](https://blockstack.org/docs) to learn how to use the CLI interface for interacting with Blockstack Core.
-
-## Troubleshooting
-
-### ImportError: No module named \_scrypt
-
-Blockstack Core's API endpoint uses
-[scrypt](https://pypi.python.org/pypi/scrypt/) to secure its wallet.  However,
-some Linux distributions have a hard time installing it.
-
-Running this command usually fixes this issue:
-
-```
-$ pip uninstall scrypt; pip install scrypt
-```
-
-### API calls fail with HTTP 403
-
-Some API calls are privileged, because they interact with the wallet and other
-sensitive API daemon state (like its config file).  In the [API
-documentation](https://blockstack.github.io), these methods are marked as
-`Requires root authorization`.
-
-To use these methods, you will need to do two things:
-* pass the API password in an `Authorization` header
-* set the `Origin` header to `http://localhost:8888`.
-
-The reason the `Origin` header is required is to stop a malicious Web page on the same host from
-accessing your API endpoint.  The origin `http://localhost:8888` is whitelisted, because this is what the
-Blockstack Browser uses.
-
-To supply the API password, put it in an `Authorization` field.  You can get the
-password from the `~/.blockstack/client.ini` file:
-
-```
-[blockstack-api]
-...
-api_password = super_secret_password  # <-- this is the password you need
-...
-```
-
-Your HTTP request should look something like this (the endpoint
-`/v1/node/config` is used in this example):
-
-```
-GET /v1/node/config HTTP/1.1
-Host: localhost:6270
-User-Agent: curl/7.58.0
-Accept: */*
-Authorization: bearer super_secret_password
-Origin: http://localhost:8888
-```
-
-You can generate this request with `curl` as follows:
-
-```
-$ curl -H 'Authorization: bearer super_secret_password' -H 'Origin: http://localhost:8888' http://localhost:6270/v1/node/config
 ```
 
 ### Getting Verbose Debugging Output
@@ -352,20 +271,18 @@ api`, as follows:
 
 ```bash
 $ blockstack-core --debug start && tail -f ~/.blockstack-server/blockstack-server.log
-$ blockstack --debug api start && tail -f ~/.blockstack/api_endpoint.log
 ```
 
-In addition, both `blockstack-core` and `blockstack api` can run in the
+In addition `blockstack-core` can run in the
 foreground, without becoming daemons.  To do so, run them as:
 
 ```bash
 $ blockstack-core --debug start --foreground
-$ blockstack --debug api start-foreground
 ```
 
 ## Developer Resources
 
-**v0.18.0** is the current stable release of Blockstack Core.  It available on the `master` branch.
+**v20.0.0.0** is the current stable release of Blockstack Core.  It available on the `master` branch.
 
 The next release is being built on the [develop](https://github.com/blockstack/blockstack-core/tree/develop). Please submit all
 pull requests to the `develop` branch.
@@ -393,9 +310,9 @@ maintains a [mailing list](https://blockstack.org/signup) which sends out
 community announcements.
 
 The greater Blockstack community regularly hosts in-person
-[meetups](https://www.meetup.com/topics/blockstack/).  The project's 
+[meetups](https://www.meetup.com/topics/blockstack/).  The project's
 [YouTube channel](https://www.youtube.com/channel/UC3J2iHnyt2JtOvtGVf_jpHQ) includes
-videos from some of these meetups, as well as video tutorials to help new 
+videos from some of these meetups, as well as video tutorials to help new
 users get started and help developers wrap their heads around the system's
 design.
 
@@ -403,15 +320,15 @@ design.
 
 You can learn more by visiting [the Blockstack Website](https://blockstack.org) and checking out the in-depth articles and documentation:
 
-- [How Blockstack Works](https://blockstack.org/docs/how-blockstack-works)
-- [Blockstack vs. DNS](https://blockstack.org/docs/blockstack-vs-dns)
-- [Blockstack vs. Namecoin](https://blockstack.org/docs/blockstack-vs-namecoin)
-- [Blockstack Namespaces](https://blockstack.org/docs/namespaces)
-- [Blockstack Light Clients](https://blockstack.org/docs/light-clients)
+- [How Blockstack Works (white paper)](https://blockstack.org/docs/how-blockstack-works)
+- [Blockstack General FAQ](https://blockstack.org/faq)
+- [Blockstack Technical FAQ](docs/faq_technical.md)
+- [Blockstack In-depth Documentation Repository](docs/README.md)
 
-You can also read the Blockstack paper:
+You can also read peer-reviewed Blockstack papers:
 
-- ["Blockstack: A Global Naming and Storage System Secured by Blockchains"](https://blockstack.org/blockstack.pdf), Proc. USENIX Annual Technical Conference (ATC ’16), June 2016
+- ["Blockstack: A Global Naming and Storage System Secured by Blockchains"](https://blockstack.org/blockstack.pdf), Proc. USENIX Annual Technical Conference ([ATC '16](https://www.usenix.org/conference/atc16)), June 2016
+- ["Extending Existing Blockchains with Virtualchain"](https://blockstack.org/virtualchain_dccl2016.pdf), Distributed Cryptocurrencies and Consensus Ledgers ([DCCL '16](https://www.zurich.ibm.com/dccl/) workshop, at [ACM PODC 2016](https://www.podc.org/podc2016/)), July 2016
 
 If you have high-level questions about Blockstack, try [searching our forum](https://forum.blockstack.org) and start a new question if your question is not answered there.
 

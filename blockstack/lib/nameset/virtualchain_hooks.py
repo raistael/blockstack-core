@@ -76,7 +76,7 @@ def get_magic_bytes():
    
     Get the magic byte sequence for our OP_RETURNs
     """
-    return MAGIC_BYTES
+    return blockstack_magic_bytes()
 
 
 def get_first_block_id():
@@ -200,6 +200,10 @@ def db_parse( block_id, txid, vtxindex, op, data, senders, inputs, outputs, fee,
    # basic sanity checks 
    if len(senders) == 0:
        raise Exception("No senders given")
+
+   if not check_tx_sender_types(senders, block_id):
+       log.warning('Invalid senders for {}'.format(txid))
+       return None
 
    # this virtualchain instance must give the 'raw_tx' hint
    assert 'raw_tx' in virtualchain_hints, 'BUG: incompatible virtualchain: requires raw_tx support'
@@ -422,7 +426,7 @@ def db_commit( block_id, op, op_data, txid, vtxindex, db_state=None ):
             assert op_data['vtxindex'] == vtxindex, "BUG: vtxindex mismatch"
             
             opcode = op_data.get('opcode', None)
-            assert opcode in OPCODE_PREORDER_OPS + OPCODE_CREATION_OPS + OPCODE_TRANSITION_OPS + OPCODE_STATELESS_OPS, \
+            assert opcode in OPCODE_PREORDER_OPS + OPCODE_CREATION_OPS + OPCODE_TRANSITION_OPS + OPCODE_STATELESS_OPS + OPCODE_TOKEN_OPS, \
                             "BUG: uncategorized opcode '%s'" % opcode
 
         except Exception, e:
@@ -451,14 +455,6 @@ def db_commit( block_id, op, op_data, txid, vtxindex, db_state=None ):
         return consensus_ops
 
     else:
-        # final commit for this block 
-        try:
-            db_state.commit_finished( block_id )
-        except Exception, e:
-            log.exception(e)
-            log.error("FATAL: failed to commit at block %s" % block_id )
-            os.abort()
-
         return None
 
 
@@ -483,15 +479,28 @@ def db_save( block_height, consensus_hash, ops_hash, accepted_ops, virtualchain_
         blockstack_opts = get_blockstack_opts()
         new_zonefile_infos = None
 
+        # vest any tokens for the next block (so they'll be immediately usable in the next block)
+        try:
+            db_state.commit_account_vesting(block_height+1)
+        except Exception as e:
+            log.exception(e)
+            log.fatal("Failed to vest accounts at {}+1".format(block_height))
+            os.abort()
+
         try:
             # flush the database
-            db_state.commit_finished( block_height )
+            db_state.commit_finished(block_height)
         except Exception as e:
             log.exception(e)
             log.error("FATAL: failed to commit at block %s" % block_height )
             os.abort()
         
         try:
+            atlas_state = None
+            if hasattr(db_state, 'atlas_state') and db_state.atlas_state is not None:
+                # normal course of action 
+                atlas_state = db_state.atlas_state
+
             # sync block data to atlas, if enabled
             if is_atlas_enabled(blockstack_opts):
                 log.debug("Synchronize Atlas DB for {}".format(block_height))
@@ -500,7 +509,7 @@ def db_save( block_height, consensus_hash, ops_hash, accepted_ops, virtualchain_
 
                 # NOTE: set end_block explicitly since db_state.lastblock still points to the previous block height
                 gc.collect()
-                new_zonefile_infos = atlasdb_sync_zonefiles(db_state, block_height, zonefile_dir, path=atlasdb_path, end_block=block_height+1)
+                new_zonefile_infos = atlasdb_sync_zonefiles(db_state, block_height, zonefile_dir, atlas_state, path=atlasdb_path, end_block=block_height+1)
                 gc.collect()
 
         except Exception as e:
@@ -523,7 +532,7 @@ def db_save( block_height, consensus_hash, ops_hash, accepted_ops, virtualchain_
                     log.warning("Instantiating subdomain index")
                     subdomain_index = SubdomainIndex(blockstack_opts['subdomaindb_path'], blockstack_opts=blockstack_opts)
                     instantiated = True
-                
+               
                 log.debug("Synchronize subdomain index for {}".format(block_height))
 
                 gc.collect()
@@ -564,13 +573,16 @@ def db_continue( block_id, consensus_hash ):
     return is_running() or os.environ.get("BLOCKSTACK_TEST") == "1"
 
 
-def sync_blockchain( working_dir, bt_opts, last_block, subdomain_index=None, expected_snapshots={}, **virtualchain_args ):
+def sync_blockchain( working_dir, bt_opts, last_block, server_state, expected_snapshots={}, **virtualchain_args ):
     """
     synchronize state with the blockchain.
     Return True on success
     Return False if we're supposed to stop indexing
     Abort on error
     """
+    
+    subdomain_index = server_state['subdomains']
+    atlas_state = server_state['atlas']
     
     # make this usable even if we haven't explicitly configured virtualchain 
     impl = sys.modules[__name__]
@@ -579,7 +591,10 @@ def sync_blockchain( working_dir, bt_opts, last_block, subdomain_index=None, exp
     # NOTE: this is the only place where a read-write handle should be created,
     # since this is the only place where the db should be modified.
     new_db = BlockstackDB.borrow_readwrite_instance(working_dir, last_block, expected_snapshots=expected_snapshots)
+
+    # propagate runtime state to virtualchain callbacks
     new_db.subdomain_index = subdomain_index
+    new_db.atlas_state = atlas_state
     
     rc = virtualchain.sync_virtualchain(bt_opts, last_block, new_db, expected_snapshots=expected_snapshots, **virtualchain_args)
     

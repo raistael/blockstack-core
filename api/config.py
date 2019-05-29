@@ -41,6 +41,8 @@ MAX_PROFILE_LIMIT = int(os.getenv('MAX_PROFILE_LIMIT','8142'))           # (8 * 
 # DEFAULT_CACHE_TIMEOUT determines the
 DEFAULT_CACHE_TIMEOUT = int(os.getenv('DEFAULT_CACHE_TIMEOUT','43200'))  # 12 hours in seconds
 
+EMPTY_CACHE_TIMEOUT = int(os.getenv('EMPTY_CACHE_TIMEOUT','60'))  # 1 minute
+
 # DEBUG increases logging verbosity
 DEBUG = str2bool(os.getenv('DEBUG','False'))
 
@@ -59,6 +61,9 @@ MONGODB_URI = os.getenv('MONGODB_URI', "mongodb://localhost")
 # BASE_API_URL sets the blockstack api connection string
 BASE_API_URL = os.getenv('BASE_API_URL', "http://localhost:6270")
 
+# INDEXER_API_URL sets the blockstack indexer daemon connection string (used only for testing at the moment)
+BASE_INDEXER_API_URL = os.getenv('BASE_INDEXER_API_URL', None)
+
 # PUBLIC_NODE_URL controls the what hostname is returned to clients
 PUBLIC_NODE_URL = os.getenv('PUBLIC_NODE_URL', 'https://core.example.org')
 
@@ -67,6 +72,13 @@ SEARCH_NODE_URL = os.getenv('SEARCH_NODE_URL', 'https://search.example.org')
 
 # SEARCH_DEFAULT_LIMIT sets the number of returns per call
 SEARCH_DEFAULT_LIMIT = int(os.getenv('SEARCH_DEFAULT_LIMIT', '50'))
+
+# sets the timeout for requests getting proxied to blockstack-core
+PROXY_TIMEOUT = float(os.getenv('BSK_SEARCH_API_TIMEOUT', '10'))
+
+# Control response to /v1/index_files
+API_BLOCKCHAIN_URL = os.getenv('BSK_API_BLOCKCHAIN_URL', '')
+API_PROFILE_URL = os.getenv('BSK_API_PROFILE_URL', '')
 
 # For the resolver endpoint
 NAMES_FILENAME = "names.json"

@@ -31,15 +31,12 @@ from time import time
 from flask import request, jsonify, make_response, render_template, Blueprint
 from flask_crossdomain import crossdomain
 
-from api.config import DEFAULT_HOST, DEFAULT_PORT, DEBUG, DEFAULT_CACHE_TIMEOUT
+from api.config import DEFAULT_HOST, DEFAULT_PORT, DEBUG, DEFAULT_CACHE_TIMEOUT, EMPTY_CACHE_TIMEOUT
 from api.config import SEARCH_DEFAULT_LIMIT as DEFAULT_LIMIT
-from api.utils import cache_control
 
 from .substring_search import search_people_by_name, search_people_by_twitter
 from .substring_search import search_people_by_username, search_people_by_bio
 from .substring_search import fetch_profiles
-
-from .attributes_index import search_proofs, validProofQuery
 
 searcher = Blueprint('searcher', __name__, url_prefix='')
 
@@ -61,8 +58,6 @@ class QueryThread(threading.Thread):
             self.results = query_twitter_database(self.query, self.limit_results)
         elif(self.query_type == 'username_search'):
             self.results = query_username_database(self.query, self.limit_results)
-            #self.found_exact_match, self.results = query_company_database(self.query)
-
 
 def error_reply(msg, code=-1):
     reply = {}
@@ -101,7 +96,6 @@ def test_alphanumeric(query):
 
 @searcher.route('/search', methods = ["GET", "POST"], strict_slashes = False)
 @crossdomain(origin='*')
-@cache_control(DEFAULT_CACHE_TIMEOUT)
 def search_by_name():
 
     query = request.args.get('query')
@@ -120,10 +114,7 @@ def search_by_name():
     except:
         pass
 
-    if validProofQuery(query):
-        return search_proofs_index(query)
-
-    elif test_alphanumeric(query) is False:
+    if test_alphanumeric(query) is False:
         pass
 
     else:
@@ -159,20 +150,12 @@ def search_by_name():
     results = {}
     results['results'] = results_people[:new_limit]
 
-    return jsonify(results)
+    resp = make_response(jsonify(results))
+    if len(results['results']) > 0:
+        cache_timeout = DEFAULT_CACHE_TIMEOUT
+    else:
+        cache_timeout = EMPTY_CACHE_TIMEOUT
 
+    resp.headers['Cache-Control'] = 'public, max-age={:d}'.format(cache_timeout)
 
-def search_proofs_index(query):
-
-    results = {}
-
-    query = request.args.get('query')
-
-    if query is None:
-        return error_reply("No query given")
-    elif query == '' or query == ' ':
-        return json.dumps({})
-
-    results['results'] = search_proofs(query)
-
-    return jsonify(results)
+    return resp

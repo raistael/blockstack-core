@@ -39,18 +39,19 @@ def _read_atlas_zonefile( zonefile_path, zonefile_hash ):
     Read and verify an atlas zone file
     """
 
-    with open(zonefile_path, "r") as f:
+    with open(zonefile_path, "rb") as f:
         data = f.read()
 
     # sanity check 
-    if not verify_zonefile( data, zonefile_hash ):
-        log.debug("Corrupt zonefile '%s'" % zonefile_hash)
-        return None
+    if zonefile_hash is not None:
+        if not verify_zonefile( data, zonefile_hash ):
+            log.debug("Corrupt zonefile '%s'" % zonefile_hash)
+            return None
 
     return data
 
 
-def get_atlas_zonefile_data( zonefile_hash, zonefile_dir ):
+def get_atlas_zonefile_data( zonefile_hash, zonefile_dir, check=True ):
     """
     Get a serialized cached zonefile from local disk 
     Return None if not found
@@ -63,7 +64,11 @@ def get_atlas_zonefile_data( zonefile_hash, zonefile_dir ):
         if not os.path.exists( zfp ):
             continue
 
-        res = _read_atlas_zonefile(zfp, zonefile_hash)
+        if check:
+            res = _read_atlas_zonefile(zfp, zonefile_hash)
+        else:
+            res = _read_atlas_zonefile(zfp, None)
+
         if res:
             return res
 
@@ -138,7 +143,7 @@ def is_zonefile_cached( zonefile_hash, zonefile_dir, validate=False):
     return res
 
 
-def store_atlas_zonefile_data( zonefile_data, zonefile_dir ):
+def store_atlas_zonefile_data(zonefile_data, zonefile_dir, fsync=True):
     """
     Store a validated zonefile.
     zonefile_data should be a dict.
@@ -155,14 +160,19 @@ def store_atlas_zonefile_data( zonefile_data, zonefile_dir ):
     zonefile_path = atlas_zonefile_path( zonefile_dir, zonefile_hash )
     zonefile_dir_path = os.path.dirname(zonefile_path)
 
+    if os.path.exists(zonefile_path):
+        # already exists 
+        return True
+
     if not os.path.exists(zonefile_dir_path):
         os.makedirs(zonefile_dir_path)
 
     try:
-        with open( zonefile_path, "w" ) as f:
+        with open( zonefile_path, "wb" ) as f:
             f.write(zonefile_data)
             f.flush()
-            os.fsync(f.fileno())
+            if fsync:
+                os.fsync(f.fileno())
 
     except Exception, e:
         log.exception(e)
@@ -180,7 +190,6 @@ def remove_atlas_zonefile_data( zonefile_hash, zonefile_dir ):
     if not os.path.exists(zonefile_dir):
         return True
 
-    zonefile_hash = get_zonefile_data_hash( zonefile_data )
     zonefile_path = atlas_zonefile_path( zonefile_dir, zonefile_hash )
     zonefile_path_legacy = atlas_zonefile_path_legacy( zonefile_dir, zonefile_hash )
 
@@ -192,19 +201,18 @@ def remove_atlas_zonefile_data( zonefile_hash, zonefile_dir ):
             os.unlink(zonefile_path)
         except:
             log.error("Failed to unlink zonefile %s (%s)" % (zonefile_hash, zonefile_path))
-            return False
 
     return True
 
 
-def add_atlas_zonefile_data( zonefile_text, zonefile_dir ):
+def add_atlas_zonefile_data(zonefile_text, zonefile_dir, fsync=True):
     """
     Add a zone file to the atlas zonefiles
     Return True on success
     Return False on error
     """
 
-    rc = store_atlas_zonefile_data( zonefile_text, zonefile_dir )
+    rc = store_atlas_zonefile_data(zonefile_text, zonefile_dir, fsync=fsync)
     if not rc:
         zonefile_hash = get_zonefile_data_hash( zonefile_text )
         log.error("Failed to save zonefile {}".format(zonefile_hash))

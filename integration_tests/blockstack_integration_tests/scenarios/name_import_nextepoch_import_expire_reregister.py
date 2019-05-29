@@ -98,7 +98,7 @@ def scenario( wallets, **kw ):
     testlib.next_block( **kw )
 
     # name should definitely not be expired 
-    res = testlib.blockstack_cli_get_name_blockchain_record( "foo.test" )
+    res = testlib.blockstack_cli_whois('foo.test')
     if 'error' in res:
         print "name is expired unexpectedly"
         print json.dumps(res, indent=4, sort_keys=True)
@@ -109,7 +109,7 @@ def scenario( wallets, **kw ):
         testlib.next_block( **kw )
 
     # name should definitely be expired 
-    res = testlib.blockstack_cli_get_name_blockchain_record( "foo.test" )
+    res = testlib.blockstack_cli_whois('foo.test')
     if 'error' not in res:
         print json.dumps(res, indent=4, sort_keys=True)
         return False
@@ -125,7 +125,7 @@ def scenario( wallets, **kw ):
 def check( state_engine ):
 
     original_price = 6400000
-    curr_price = original_price * blockstack.lib.config.get_epoch_price_multiplier( 260, "test" )
+    curr_price = original_price * blockstack.lib.config.get_epoch_price_multiplier( 260, "test", 'BTC' )
 
     # not revealed, but ready 
     ns = state_engine.get_namespace_reveal( "test" )

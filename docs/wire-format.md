@@ -1,8 +1,15 @@
+---
+layout: core
+permalink: /:collection/:path.html
+---
+# Bitcoin wire format
+{:.no_toc}
+
 This page is for organizations who want to be able to create and send name operation transactions to the blockchain(s) Blockstack supports.
+It describes the transaction formats for the Bitcoin blockchain.
 
-# Bitcoin
-
-This section describes the transaction formats for the Bitcoin blockchain.
+* TOC
+{:toc}
 
 ## Transaction format
 
@@ -16,7 +23,7 @@ The general transaction layout is as follows:
 | ------------------------ | ----------------------- |
 | Owner scriptSig (1)      | `OP_RETURN <payload>` (2)  |
 | Payment scriptSig        | Owner scriptPubKey (3) |
-| Payment scriptSig... (4) | 
+| Payment scriptSig... (4) |
 | ...                  (4) | ... (5)                |
 
 (1) The owner `scriptSig` is *always* the first input.
@@ -24,16 +31,22 @@ The general transaction layout is as follows:
 (3) The owner `scriptPubKey` is *always* the second output.
 (4) The payer can use as many payment inputs as (s)he likes.
 (5) At most one output will be the "change" `scriptPubKey` for the payer.
+Different operations require different outputs.
 
 ## Payload Format
 
 Each Blockstack transaction in Bitcoin describes the name operation within an `OP_RETURN` output.  It encodes name ownership, name fees, and payments as `scriptPubKey` outputs.  The specific operations are described below.
 
-Each `OP_RETURN` payload *always* starts with `id` (called the "magic" bytes in this document), followed by a one-byte `op` that describes the operation.
+Each `OP_RETURN` payload *always* starts with the two-byte string `id` (called the "magic" bytes in this document), followed by a one-byte `op` that describes the operation.
 
 ### NAME_PREORDER
 
 Op: `?`
+
+Description:  This transaction commits to the *hash* of a name.  It is the first
+transaction of two transactions that must be sent to register a name in BNS.
+
+Example: [6730ae09574d5935ffabe3dd63a9341ea54fafae62fde36c27738e9ee9c4e889](https://www.blocktrail.com/BTC/tx/6730ae09574d5935ffabe3dd63a9341ea54fafae62fde36c27738e9ee9c4e889)
 
 `OP_RETURN` wire format:
 ```
@@ -58,7 +71,14 @@ Notes:
 
 Op: `:`
 
+Description:  This transaction reveals the name whose hash was announced by a
+previous `NAME_PREORDER`.  It is the second of two transactions that must be
+sent to register a name in BNS.
+
+Example: [55b8b42fc3e3d23cbc0f07d38edae6a451dfc512b770fd7903725f9e465b2925](https://www.blocktrail.com/BTC/tx/55b8b42fc3e3d23cbc0f07d38edae6a451dfc512b770fd7903725f9e465b2925)
+
 `OP_RETURN` wire format (2 variations allowed):
+
 Variation 1:
 ```
     0    2  3                             39
@@ -93,7 +113,13 @@ hash for a name without the extra `NAME_UPDATE` transaction.
 
 Op: `:`
 
+Description:  This transaction renews a name in BNS.  The name must still be
+registered and not expired, and owned by the transaction sender.
+
+Example: [e543211b18e5d29fd3de7c0242cb017115f6a22ad5c6d51cf39e2b87447b7e65](https://www.blocktrail.com/BTC/tx/e543211b18e5d29fd3de7c0242cb017115f6a22ad5c6d51cf39e2b87447b7e65)
+
 `OP_RETURN` wire format (2 variations allowed):
+
 Variation 1:
 ```
     0    2  3                             39
@@ -135,16 +161,25 @@ Notes:
 
 Op: `+`
 
+Description:  This transaction sets the name state for a name to the given
+`value`.  In practice, this is used to announce new DNS zone file hashes to the [Atlas
+network]({{ site.baseurl }}/core/atlas/overview.html).
+
+Example: [e2029990fa75e9fc642f149dad196ac6b64b9c4a6db254f23a580b7508fc34d7](https://www.blocktrail.com/BTC/tx/e2029990fa75e9fc642f149dad196ac6b64b9c4a6db254f23a580b7508fc34d7)
+
 `OP_RETURN` wire format:
 ```
     0     2  3                                   19                      39
     |-----|--|-----------------------------------|-----------------------|
-    magic op  hash128(name.ns_id,consensus hash)        value
+    magic op  hash128(name.ns_id,consensus hash)      zone file hash
 ```
 
 Note that `hash128(name.ns_id, consensus hash)` is the first 16 bytes of a SHA256 hash over the name concatenated to the hexadecimal string of the consensus hash (not the bytes corresponding to that hex string).
+See the [Method Glossary](#method-glossary) below.
 
 Example: `hash128("jude.id" + "8d8762c37d82360b84cf4d87f32f7754") == "d1062edb9ec9c85ad1aca6d37f2f5793"`.
+
+The 20 byte zone file hash is computed from zone file data by using `ripemd160(sha56(zone file data))`
 
 Inputs:
 * owner `scriptSig`
@@ -153,11 +188,16 @@ Inputs:
 Outputs:
 * `OP_RETURN` payload
 * owner's `scriptPubkey`
-* payment `scriptPubkey` change 
+* payment `scriptPubkey` change
 
 ### NAME_TRANSFER
 
 Op: `>`
+
+Description:  This transaction changes the public key hash that owns the name in
+BNS.
+
+Example: [7a0a3bb7d39b89c3638abc369c85b5c028d0a55d7804ba1953ff19b0125f3c24](https://www.blocktrail.com/BTC/tx/7a0a3bb7d39b89c3638abc369c85b5c028d0a55d7804ba1953ff19b0125f3c24)
 
 `OP_RETURN` wire format:
 ```
@@ -177,15 +217,21 @@ Outputs:
 * `OP_RETURN` payload
 * new name owner's `scriptPubkey`
 * old name owner's `scriptPubkey`
-* payment `scriptPubkey` change 
+* payment `scriptPubkey` change
 
-Notes: 
+Notes:
 
 * The `keep data?` byte controls whether or not the name's 20-byte value is preserved.  This value is either `>` to preserve it, or `~` to delete it.
 
 ### NAME_REVOKE
 
 Op: `~`
+
+Description:  This transaction destroys a registered name.  Its name state value
+in BNS will be cleared, and no further transactions will be able to affect the
+name until it expires (if its namespace allows it to expire at all).
+
+Example: [eb2e84a45cf411e528185a98cd5fb45ed349843a83d39fd4dff2de47adad8c8f](https://www.blocktrail.com/BTC/tx/eb2e84a45cf411e528185a98cd5fb45ed349843a83d39fd4dff2de47adad8c8f)
 
 `OP_RETURN` wire format:
 ```
@@ -208,6 +254,16 @@ Outputs:
 ### ANNOUNCE
 
 Op: `#`
+
+Description:  This transaction does not affect any names in BNS, but it allows a
+user to send a message to other BNS nodes.  In order for the message to be
+received, the following must be true:
+
+* The sender must have a BNS name
+* The BNS nodes must list the sender's BNS name as being a "trusted message
+  sender"
+* The message must have already been propagated through the [Atlas
+  network]({{ site.baseurl }}/core/atlas/overview.html).  This transaction references it by content hash.
 
 `OP_RETURN` wire format:
 
@@ -234,6 +290,11 @@ Notes:
 
 Op: `*`
 
+Description:  This transaction announces the *hash* of a new namespace.  It is the
+first of three transactions that must be sent to create a namespace.
+
+Example: [5f00b8e609821edd6f3369ee4ee86e03ea34b890e242236cdb66ef6c9c6a1b28](https://www.blocktrail.com/BTC/tx/5f00b8e609821edd6f3369ee4ee86e03ea34b890e242236cdb66ef6c9c6a1b28)
+
 `OP_RETURN` wire format:
 ```
    0     2   3                                         23               39
@@ -258,6 +319,11 @@ Notes:
 ### NAMESPACE_REVEAL
 
 Op: `&`
+
+Description:  This transaction reveals the namespace ID and namespace rules
+for a previously-anounced namespace hash (sent by a previous `NAMESPACE_PREORDER`).
+
+Example: [ab54b1c1dd5332dc86b24ca2f88b8ca0068485edf0c322416d104c5b84133a32](https://www.blocktrail.com/BTC/tx/ab54b1c1dd5332dc86b24ca2f88b8ca0068485edf0c322416d104c5b84133a32)
 
 `OP_RETURN` wire format:
 ```
@@ -291,7 +357,7 @@ The rules for a namespace are as follows:
    * a name can fall into one of 16 buckets, measured by length.  Bucket 16 incorporates all names at least 16 characters long.
    * the pricing structure applies a multiplicative penalty for having numeric characters, or punctuation characters.
    * the price of a name in a bucket is ((coeff) * (base) ^ (bucket exponent)) / ((numeric discount multiplier) * (punctuation discount multiplier))
-   
+
 Example:
 * base = 10
 * coeff = 2
@@ -313,6 +379,12 @@ With the above example configuration, the following are true:
 ### NAME_IMPORT
 
 Op: `;`
+
+Description:  This transaction registers a name and some name state into a
+namespace that has been revealed, but not been launched.  Only the namespace
+creator can import names.  See the [namespace creation section]({{ site.baseurl }}/core/naming/namespace.html) for details.
+
+Example: [c698ac4b4a61c90b2c93dababde867dea359f971e2efcf415c37c9a4d9c4f312](https://www.blocktrail.com/BTC/tx/c698ac4b4a61c90b2c93dababde867dea359f971e2efcf415c37c9a4d9c4f312)
 
 `OP_RETURN` wire format:
 ```
@@ -343,9 +415,15 @@ Notes:
 
 Op: `!`
 
+Description:  This transaction launches a namesapce.  Only the namespace creator
+can send this transaction.  Once sent, anyone can register names in the
+namespace.
+
+Example: [2bf9a97e3081886f96c4def36d99a677059fafdbd6bdb6d626c0608a1e286032](https://www.blocktrail.com/BTC/tx/2bf9a97e3081886f96c4def36d99a677059fafdbd6bdb6d626c0608a1e286032)
+
 `OP_RETURN` wire format:
 ```
-   
+
    0     2  3  4           23
    |-----|--|--|------------|
    magic op  .  ns_id
@@ -360,6 +438,34 @@ Outputs:
 
 Notes:
 * This transaction must be sent within 1 year of the corresponding `NAMESPACE_REVEAL` to be accepted.
+
+### TOKEN_TRANSFER
+
+Op: `$`
+
+Description:  This transaction transfers tokens from one account to another.  Only `STACKS` tokens can be transferred at this time.  The transaction encodes the number of *micro-Stacks* to send.
+
+Example: [093983ca71a6a9dd041c0bdb8b3012824d726ee26fe51da8335a06e8a08c2798](https://www.blocktrail.com/BTC/tx/093983ca71a6a9dd041c0bdb8b3012824d726ee26fe51da8335a06e8a08c2798)
+
+`OP_RETURN` wire format:
+```
+    0     2  3              19         38          46                        80
+    |-----|--|--------------|----------|-----------|-------------------------|
+    magic op  consensus_hash token_type amount (LE) scratch area
+```
+
+Inputs:
+* Sender's scriptSig's
+
+Outputs:
+* `OP_RETURN` payload
+* Recipient scriptPubKey (encodes the address of the receiving account)
+* Change address for the sender
+
+Notes:
+* The `amount` field is an 8-byte litte-endian number that encodes the number of micro-Stacks.
+* The `token_type` field must be `STACKS`.  All other unused bytes in this field must be `\x00`.
+* The `scratch area` field is optional -- it can be up to 34 bytes, and include any data you want.
 
 ## Method Glossary
 
@@ -399,9 +505,9 @@ def hex_hash160(s, hex_format=False):
 def hash_name(name, script_pubkey, register_addr=None):
     """
     Generate the hash over a name and hex-string script pubkey.
-    Returns the hex-encoded string RIPEMD160(SHA256(x)), where 
-    x is the byte string composed of the concatenation of the 
-    binary 
+    Returns the hex-encoded string RIPEMD160(SHA256(x)), where
+    x is the byte string composed of the concatenation of the
+    binary
     """
     bin_name = b40_to_bin(name)
     name_and_pubkey = bin_name + unhexlify(script_pubkey)
@@ -419,4 +525,3 @@ def hash128(data):
     """
     return hexlify(bin_sha256(data)[0:16])
 ```
-

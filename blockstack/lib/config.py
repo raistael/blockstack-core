@@ -26,6 +26,7 @@ import sys
 import copy
 import socket
 import stun
+import jsonschema
 from ConfigParser import SafeConfigParser
 
 from ..version import __version__
@@ -33,12 +34,26 @@ from ..version import __version__
 import virtualchain
 log = virtualchain.get_logger("blockstack-server")
 
+if not __debug__:
+    log.error('FATAL: __debug__ must be set')
+    os.abort()
+
 DEBUG = True
 VERSION = __version__
 
+ATLAS_SEEDS_ENV_VAR = 'BLOCKSTACK_ATLAS_SEEDS'
+ATLAS_HOSTNAME_ENV_VAR = 'BLOCKSTACK_ATLAS_HOSTNAME'
+
 # namespace version bits
-NAMESPACE_VERSION_PAY_TO_BURN = 0x1
+NAMESPACE_VERSION_PAY_TO_BURN = 0x1     # in epoch 4, this means "burn either bitcoin or stacks"
 NAMESPACE_VERSION_PAY_TO_CREATOR = 0x2
+NAMESPACE_VERSION_PAY_WITH_STACKS = 0x3
+
+NAMESPACE_VERSIONS_SUPPORTED = [
+    NAMESPACE_VERSION_PAY_TO_BURN, 
+    NAMESPACE_VERSION_PAY_TO_CREATOR,
+    NAMESPACE_VERSION_PAY_WITH_STACKS,
+]
 
 """ constants
 """
@@ -58,30 +73,45 @@ NAME_PREORDER_EXPIRE = BLOCKS_PER_DAY
 AVERAGE_BLOCKS_PER_HOUR = MINUTES_PER_HOUR/AVERAGE_MINUTES_PER_BLOCK
 
 FAST_SYNC_PUBLIC_KEYS = [
-    '0211f4f997efa0fb018082a2ed3a0af8ba1b042da03f655d953b75642fce395e9e',
+    '038ff7796a927f31707924b41ed6587475d26d3f7a19bc47941d1c2b017f64780c'
 ]
 
-FAST_SYNC_DEFAULT_URL = 'http://fast-sync.blockstack.org/snapshot.bsk'
+FAST_SYNC_DEFAULT_URL = 'http://fast-sync-20.blockstack.org/snapshot.bsk'
 
 """ name price configs
 """
 
+NAME_COST_UNIT = 100            # minimum name cost in BTC is 100 satoshis, or about USD $0.00026 in September 2015 BTC
+NAME_COST_UNIT_STACKS = 1733    # minimum name cost in STACKs is 1733 microSTACKs, or about $0.00026 with 1 STACK = USD $0.15
+
+# BTC namespace costs (assumes ~USD $260/BTC)
+# units in satoshis
 SATOSHIS_PER_BTC = 10**8
-PRICE_FOR_1LETTER_NAMES = 10*SATOSHIS_PER_BTC
-PRICE_DROP_PER_LETTER = 10
-PRICE_DROP_FOR_NON_ALPHABETIC = 10
-ALPHABETIC_PRICE_FLOOR = 10**4
-
-NAME_COST_UNIT = 100    # 100 satoshis
-
 NAMESPACE_1_CHAR_COST = 400.0 * SATOSHIS_PER_BTC        # ~$96,000
 NAMESPACE_23_CHAR_COST = 40.0 * SATOSHIS_PER_BTC        # ~$9,600
 NAMESPACE_4567_CHAR_COST = 4.0 * SATOSHIS_PER_BTC       # ~$960
-NAMESPACE_8UP_CHAR_COST = 0.4 * SATOSHIS_PER_BTC      # ~$96
+NAMESPACE_8UP_CHAR_COST = 0.4 * SATOSHIS_PER_BTC        # ~$96
+
+# STACKS namespace costs
+# units in microSTACKs
+STACKS_PRICE = 0.15      # USD $0.15
+STACKS_PER_MICROSTACKS = 10**-6
+MICROSTACKS_PER_STACKS = 10**6
+NAMESPACE_1_CHAR_COST_STACKS = int((96000.0 * MICROSTACKS_PER_STACKS) / STACKS_PRICE)
+NAMESPACE_23_CHAR_COST_STACKS = int((9600.0 * MICROSTACKS_PER_STACKS) / STACKS_PRICE)
+NAMESPACE_4567_CHAR_COST_STACKS = int((960.0 * MICROSTACKS_PER_STACKS) / STACKS_PRICE)
+NAMESPACE_8UP_CHAR_COST_STACKS = int((96.0 * MICROSTACKS_PER_STACKS) / STACKS_PRICE)
+
+# converting from BTC to STACKs for v1 and v2 namespaces
+# 1 BTC = $6500 (October 2018); 1 STACK = $0.15 (strike price)
+# 1 satoshi = $6.5e-5 (Sept 2015); 1 microStack = $1.5e-7
+# 1 microStacks/satoshi = 6.5e-5 / 1.5e-7 = 650 / 15
+# Record separate numerator and denominator so we can do integer math.
+MICROSTACKS_PER_SATOSHI_NUM = 650
+MICROSTACKS_PER_SATOSHI_DEN = 15
 
 NAMESPACE_PREORDER_EXPIRE = BLOCKS_PER_DAY      # namespace preorders expire after 1 day, if not revealed
 NAMESPACE_REVEAL_EXPIRE = BLOCKS_PER_YEAR       # namespace reveals expire after 1 year, if not readied.
-
 
 """ blockstack configs
 """
@@ -89,11 +119,24 @@ BLOCKSTACK_TEST = os.environ.get('BLOCKSTACK_TEST', None)
 BLOCKSTACK_TEST_NODEBUG = os.environ.get('BLOCKSTACK_TEST_NODEBUG', None)
 BLOCKSTACK_DEBUG = os.environ.get('BLOCKSTACK_DEBUG', None)
 BLOCKSTACK_TEST_FIRST_BLOCK = os.environ.get('BLOCKSTACK_TEST_FIRST_BLOCK', None)
-BLOCKSTACK_TESTNET = os.environ.get("BLOCKSTACK_TESTNET", None)
-BLOCKSTACK_TESTNET3 = os.environ.get("BLOCKSTACK_TESTNET3", None)
-BLOCKSTACK_TESTNET_FIRST_BLOCK = os.environ.get("BLOCKSTACK_TESTNET_FIRST_BLOCK", None)
-BLOCKSTACK_DRY_RUN = os.environ.get('BLOCKSTACK_DRY_RUN', None)
+BLOCKSTACK_TESTNET = os.environ.get("BLOCKSTACK_TESTNET", None)     # changes encoding of addresses
+BLOCKSTACK_TESTNET3 = os.environ.get("BLOCKSTACK_TESTNET3", None)   # changes bitcoin protocol
+BLOCKSTACK_PUBLIC_TESTNET = os.environ.get("BLOCKSTACK_PUBLIC_TESTNET", None)   # set if we're running on the testnet
 BLOCKSTACK_TEST_SUBDOMAINS_FIRST_BLOCK = os.environ.get('BLOCKSTACK_TEST_SUBDOMAINS_FIRST_BLOCK', None)
+
+if BLOCKSTACK_TEST:
+    # test environment can override these deadlines
+    if os.environ.get('BLOCKSTACK_TEST_NAMESPACE_PREORDER_EXPIRE'):
+        NAMESPACE_PREORDER_EXPIRE = int(os.environ['BLOCKSTACK_TEST_NAMESPACE_PREORDER_EXPIRE'])
+
+    if os.environ.get('BLOCKSTACK_TEST_NAMESPACE_REVEAL_EXPIRE'):
+        NAMESPACE_REVEAL_EXPIRE = int(os.environ['BLOCKSTACK_TEST_NAMESPACE_REVEAL_EXPIRE'])
+
+    if os.environ.get("BLOCKSTACK_TEST_NAME_PREORDER_EXPIRE"):
+        NAME_PREORDER_EXPIRE = int(os.environ['BLOCKSTACK_TEST_NAME_PREORDER_EXPIRE'])
+
+    if os.environ.get('BLOCKSTACK_CORE_VERSION'):
+        VERSION = os.environ['BLOCKSTACK_CORE_VERSION']
 
 MAX_NAMES_PER_SENDER = 25                # a single sender script can own up to this many names
 
@@ -128,23 +171,49 @@ if os.environ.get("BLOCKSTACK_CORE_NUM_CONFS", None) is not None:
 
 
 """ RPC server configs
+    Note that these can get overwritten if BLOCKSTACK_TESTNET_ACTIVE is set!  See below
 """
 RPC_SERVER_TEST_PORT = 16264
 RPC_SERVER_PORT = None      # non-HTTPS port
-RPC_SERVER_IP = None        # looked up via STUN
+RPC_SERVER_IP = None        # looked up via STUN, config file, or getaddrinfo
 if BLOCKSTACK_TEST is not None:
     RPC_SERVER_PORT = RPC_SERVER_TEST_PORT
 else:
     RPC_SERVER_PORT = 6264
 
+DEFAULT_API_HOST = 'localhost'
+if os.environ.get('BLOCKSTACK_API_HOST'):
+    DEFAULT_API_HOST = os.environ.get('BLOCKSTACK_API_HOST')
+    log.debug('BLOCKSTACK_API_HOST = {}'.format(DEFAULT_API_HOST))
+
+DEFAULT_API_PORT = 6270  # API endpoint port
+if BLOCKSTACK_TEST:
+    DEFAULT_API_PORT = 16268
+
+if os.environ.get('BLOCKSTACK_API_PORT'):
+    DEFAULT_API_PORT = int(os.environ.get('BLOCKSTACK_API_PORT'))
+    log.debug('BLOCKSTACK_API_PORT = {}'.format(DEFAULT_API_PORT))
+
 RPC_DEFAULT_TIMEOUT = 30  # in secs
 RPC_MAX_ZONEFILE_LEN = 40960     # 40KB
 RPC_MAX_INDEXING_DELAY = 2 * 3600   # 2 hours; maximum amount of time before the absence of new blocks causes the node to stop responding
 
-MAX_RPC_LEN = RPC_MAX_ZONEFILE_LEN * 10    # maximum blockstackd RPC length
+MAX_RPC_LEN = RPC_MAX_ZONEFILE_LEN * 150    # maximum blockstackd RPC length (100 40K zone files, plus base64 encoding overhead and XMLRPC padding)
+
 if os.environ.get("BLOCKSTACK_TEST_MAX_RPC_LEN"):
     MAX_RPC_LEN = int(os.environ.get("BLOCKSTACK_TEST_MAX_RPC_LEN"))
     print("Overriding MAX_RPC_LEN to {}".format(MAX_RPC_LEN))
+
+MAX_RPC_THREADS = 1000      # typical rlimit for the number of open file descriptors, minus a buffer
+if os.environ.get('BLOCKSTACK_RPC_MAX_THREADS'):
+    MAX_RPC_THREADS = int(os.environ.get('BLOCKSTACK_RPC_MAX_THREADS'))
+    print('Overriding MAX_RPC_THREADS to {}'.format(MAX_RPC_THREADS))
+
+if BLOCKSTACK_TEST:
+    RPC_MAX_INDEXING_DELAY = 5
+
+# threshold for garbage-collection
+GC_EVENT_THRESHOLD = 15
 
 
 """ block indexing configs
@@ -155,11 +224,13 @@ if BLOCKSTACK_TEST is not None:
 
 FIRST_BLOCK_MAINNET = 373601
 
-if BLOCKSTACK_TEST and BLOCKSTACK_TEST_FIRST_BLOCK:
-    FIRST_BLOCK_MAINNET = int(BLOCKSTACK_TEST_FIRST_BLOCK)
+if BLOCKSTACK_TEST:
+    if BLOCKSTACK_TEST_FIRST_BLOCK:
+        FIRST_BLOCK_MAINNET = int(BLOCKSTACK_TEST_FIRST_BLOCK)
 
-elif BLOCKSTACK_TEST and BLOCKSTACK_TESTNET_FIRST_BLOCK:
-    FIRST_BLOCK_MAINNET = int(BLOCKSTACK_TESTNET_FIRST_BLOCK)
+else:
+    if os.environ.get('BLOCKSTACK_TESTNET_START_BLOCK'):
+        FIRST_BLOCK_MAINNET = int(os.environ['BLOCKSTACK_TESTNET_START_BLOCK'])
 
 SUBDOMAINS_FIRST_BLOCK = 478872
 
@@ -176,23 +247,74 @@ GENESIS_SNAPSHOT = {
     str(FIRST_BLOCK_MAINNET-1): "17ac43c1d8549c3181b200f1bf97eb7d",
 }
 
+GENESIS_BLOCK = None
+GENESIS_BLOCK_STAGES = None
+GENESIS_BLOCK_INSTANTIATED = False
+GENESIS_BLOCK_STAGES_INSTANTIATED = False
+
+try:
+    # use built-in one 
+    import genesis_block
+    GENESIS_BLOCK = genesis_block.GENESIS_BLOCK
+    GENESIS_BLOCK_STAGES = genesis_block.GENESIS_BLOCK_STAGES
+except:
+    if not BLOCKSTACK_TEST:
+        print >> sys.stderr, 'FATAL: no genesis block defined'
+        os.abort()
+
+    print >> sys.stderr, 'WARNING: will try to load a genesis block from $BLOCKSTACK_GENESIS_BLOCK_PATH at runtime'
+
+
+def get_genesis_block():
+    return GENESIS_BLOCK
+
+def get_genesis_block_stages():
+    return GENESIS_BLOCK_STAGES
+
+def set_genesis_block(new_genesis_block):
+    global GENESIS_BLOCK, GENESIS_BLOCK_INSTANTIATED
+    if GENESIS_BLOCK_INSTANTIATED:
+        assert BLOCKSTACK_TEST, 'Cannot set the genesis block in production mode'
+
+    GENESIS_BLOCK = new_genesis_block
+    GENESIS_BLOCK_INSTANTIATED = True
+
+def set_genesis_block_stages(new_genesis_block_stages):
+    global GENESIS_BLOCK_STAGES, GENESIS_BLOCK_STAGES_INSTANTIATED
+    if GENESIS_BLOCK_STAGES_INSTANTIATED:
+        assert BLOCKSTACK_TEST, 'Cannot set the genesis block stages in production mode'
+
+    GENESIS_BLOCK_STAGES = new_genesis_block_stages
+    GENESIS_BLOCK_STAGES_INSTANTIATED = True
+
+def is_genesis_block_instantiated():
+    return GENESIS_BLOCK_INSTANTIATED
+
+
 """
 Epoch constants govern externally-adjusted behaviors over different time intervals.
 Specifically:
     * NAMESPACE_LIFETIME_MULTIPLIER:    constant to multiply name lifetimes by
     * NAMESPACE_LIFETIME_GRACE_PERIOD:  constant to add to the name's lifetime when it's about to expire
     * PRICE_MULTIPLIER:                 constant to multiply name and namespace prices by
+    * PRICE_DIVISOR:                    constant to divide name and namespace prices by
 """
 EPOCH_FIELDS = [
     "end_block",
     "namespaces",
-    "features"
+    "features",
+    "namespace_prices",
+    "namespace_prices_stacks",
+    "namespace_price_units",
+    "script_types",
+    "sender_types",
 ]
 
 EPOCH_NAMESPACE_FIELDS = [
     "NAMESPACE_LIFETIME_MULTIPLIER",
     "NAMESPACE_LIFETIME_GRACE_PERIOD",
-    "PRICE_MULTIPLIER"
+    "PRICE_MULTIPLIER",
+    "PRICE_DIVISOR",
 ]
 
 # epoch features
@@ -201,37 +323,65 @@ EPOCH_FEATURE_SEGWIT = "BLOCKSTACK_SEGWIT"
 EPOCH_FEATURE_OP_REGISTER_UPDATE = "BLOCKSTACK_OP_REGISTER_UPDATE"
 EPOCH_FEATURE_OP_RENEW_TRANSFER_UPDATE = "BLOCKSTACK_OP_RENEW_TRANSFER_UPDATE"
 EPOCH_FEATURE_NAMESPACE_BURN_TO_CREATOR = "BLOCKSTACK_NAMESPACE_BURN_TO_CREATOR"
+EPOCH_FEATURE_NAMESPACE_PAY_WITH_STACKS = "BLOCKSTACK_NAMESPACE_PAY_WITH_STACKS"
+EPOCH_FEATURE_STACKS_BUY_NAMESPACES = "BLOCKSTACK_STACKS_BUY_NAMESPACES"
+EPOCH_FEATURE_NAMEOPS_COST_TOKENS = "BLOCKSTACK_NAMEOPS_COST_TOKENS"
+EPOCH_FEATURE_FIX_PREORDER_EXPIRE = "BLOCKSTACK_PREORDER_EXPIRE"
+EPOCH_FEATURE_TOKEN_TRANSFER = "BLOCKSTACK_TOKEN_TRANSFER"
+EPOCH_FEATURE_INT_DIVISION = "BLOCKSTACK_INT_DIVISION"
 
 # when epochs end (-1 means "never")
 EPOCH_NOW = -1
 EPOCH_1_END_BLOCK = 436650      # F-Day 2016
 EPOCH_2_END_BLOCK = 488500      # F-day 2017
-EPOCH_3_END_BLOCK = 541843      # F-day 2018 (TODO)
+EPOCH_3_END_BLOCK = 547921      # F-day 2018
+EPOCH_4_END_BLOCK = EPOCH_NOW
 
 EPOCH_1_NAMESPACE_LIFETIME_MULTIPLIER_id = 1
 EPOCH_2_NAMESPACE_LIFETIME_MULTIPLIER_id = 2
 EPOCH_3_NAMESPACE_LIFETIME_MULTIPLIER_id = 2
+EPOCH_4_NAMESPACE_LIFETIME_MULTIPLIER_id = 2
 
 EPOCH_1_NAMESPACE_LIFETIME_GRACE_PERIOD_id = 0
 EPOCH_2_NAMESPACE_LIFETIME_GRACE_PERIOD_id = 0
 EPOCH_3_NAMESPACE_LIFETIME_GRACE_PERIOD_id = 5000   # about 30 days
+EPOCH_4_NAMESPACE_LIFETIME_GRACE_PERIOD_id = 5000   # about 30 days
 
 EPOCH_1_PRICE_MULTIPLIER_id = 1.0
 EPOCH_2_PRICE_MULTIPLIER_id = 1.0
 EPOCH_3_PRICE_MULTIPLIER_id = 0.1
+# after epoch 3, this becomes an integer divisor
+EPOCH_4_PRICE_DIVISOR_id = 10
+
+EPOCH_1_PRICE_MULTIPLIER_STACKS = 1.0
+EPOCH_2_PRICE_MULTIPLIER_STACKS = 1.0
+EPOCH_3_PRICE_MULTIPLIER_STACKS = 1.0
+# after epcoh 3, this becomes an integer divisor
+EPOCH_4_PRICE_DIVISOR_STACKS = 1
 
 EPOCH_1_NAMESPACE_RECEIVE_FEES_PERIOD_id = 0
 EPOCH_2_NAMESPACE_RECEIVE_FEES_PERIOD_id = 0
 EPOCH_3_NAMESPACE_RECEIVE_FEES_PERIOD_id = BLOCKS_PER_YEAR
+EPOCH_4_NAMESPACE_RECEIVE_FEES_PERIOD_id = BLOCKS_PER_YEAR
 
 EPOCH_1_FEATURES = []
 EPOCH_2_FEATURES = [EPOCH_FEATURE_MULTISIG]
 EPOCH_3_FEATURES = [EPOCH_FEATURE_MULTISIG, EPOCH_FEATURE_SEGWIT, EPOCH_FEATURE_OP_REGISTER_UPDATE, EPOCH_FEATURE_OP_RENEW_TRANSFER_UPDATE, EPOCH_FEATURE_NAMESPACE_BURN_TO_CREATOR]
+EPOCH_4_FEATURES = [
+    EPOCH_FEATURE_MULTISIG,
+    EPOCH_FEATURE_SEGWIT,
+    EPOCH_FEATURE_OP_REGISTER_UPDATE,
+    EPOCH_FEATURE_OP_RENEW_TRANSFER_UPDATE,
+    EPOCH_FEATURE_NAMESPACE_BURN_TO_CREATOR,
+    EPOCH_FEATURE_NAMESPACE_PAY_WITH_STACKS,
+    EPOCH_FEATURE_STACKS_BUY_NAMESPACES,
+    EPOCH_FEATURE_FIX_PREORDER_EXPIRE,
+    EPOCH_FEATURE_NAMEOPS_COST_TOKENS,
+    EPOCH_FEATURE_TOKEN_TRANSFER,
+    EPOCH_FEATURE_INT_DIVISION,
+]
 
-# minimum block height at which this server can run
-EPOCH_MINIMUM = EPOCH_1_END_BLOCK + 1
-
-NUM_EPOCHS = 3
+NUM_EPOCHS = 4
 for i in xrange(1, NUM_EPOCHS+1):
     # epoch lengths can be altered by the test framework, for ease of tests
     if os.environ.get("BLOCKSTACK_EPOCH_%s_END_BLOCK" % i, None) is not None and BLOCKSTACK_TEST:
@@ -241,6 +391,10 @@ for i in xrange(1, NUM_EPOCHS+1):
     if os.environ.get("BLOCKSTACK_EPOCH_%s_PRICE_MULTIPLIER" % i, None) is not None and BLOCKSTACK_TEST:
         exec("EPOCH_%s_PRICE_MULTIPLIER_id = float(%s)" % (i, os.environ.get("BLOCKSTACK_EPOCH_%s_PRICE_MULTIPLIER" % i)))
         log.warn("EPOCH_%s_PRICE_MULTIPLIER_id = %s" % (i, eval("EPOCH_%s_PRICE_MULTIPLIER_id" % i)))
+
+    if os.environ.get("BLOCKSTACK_EPOCH_%s_PRICE_DIVISOR" % i, None) is not None and BLOCKSTACK_TEST:
+        exec("EPOCH_%s_PRICE_DIVISOR_id = float(%s)" % (i, os.environ.get("BLOCKSTACK_EPOCH_%s_PRICE_DIVISOR" % i)))
+        log.warn("EPOCH_%s_PRICE_DIVISOR_id = %s" % (i, eval("EPOCH_%s_PRICE_DIVISOR_id" % i)))
 
     if os.environ.get("BLOCKSTACK_EPOCH_%s_NAMESPACE_LIFETIME_MULTIPLIER" % i, None) is not None and BLOCKSTACK_TEST:
         exec("EPOCH_%s_NAMESPACE_LIFETIME_MULTIPLIER_id = int(%s)" % (i, os.environ.get("BLOCKSTACK_EPOCH_%s_NAMESPACE_LIFETIME_MULTIPLIER" % i)))
@@ -268,12 +422,18 @@ EPOCHS = [
                 "NAMESPACE_LIFETIME_MULTIPLIER": EPOCH_1_NAMESPACE_LIFETIME_MULTIPLIER_id,
                 "NAMESPACE_LIFETIME_GRACE_PERIOD": EPOCH_1_NAMESPACE_LIFETIME_GRACE_PERIOD_id,
                 "PRICE_MULTIPLIER": EPOCH_1_PRICE_MULTIPLIER_id,
+                "PRICE_MULTIPLIER_STACKS": EPOCH_1_PRICE_MULTIPLIER_STACKS,
+                "PRICE_DIVISOR": None,
+                "PRICE_DIVISOR_STACKS": None,
                 "NAMESPACE_RECEIVE_FEES_PERIOD": EPOCH_1_NAMESPACE_RECEIVE_FEES_PERIOD_id,
             },
             "*": {
                 "NAMESPACE_LIFETIME_MULTIPLIER": EPOCH_1_NAMESPACE_LIFETIME_MULTIPLIER_id,
                 "NAMESPACE_LIFETIME_GRACE_PERIOD": EPOCH_1_NAMESPACE_LIFETIME_GRACE_PERIOD_id,
                 "PRICE_MULTIPLIER": EPOCH_1_PRICE_MULTIPLIER_id,
+                "PRICE_MULTIPLIER_STACKS": EPOCH_1_PRICE_MULTIPLIER_STACKS,
+                "PRICE_DIVISOR": None,
+                "PRICE_DIVISOR_STACKS": None,
                 "NAMESPACE_RECEIVE_FEES_PERIOD": EPOCH_1_NAMESPACE_RECEIVE_FEES_PERIOD_id,
             },
         },
@@ -299,7 +459,11 @@ EPOCHS = [
             NAMESPACE_8UP_CHAR_COST,    # 18-character cost
             NAMESPACE_8UP_CHAR_COST,    # 19-character cost 
         ],
-        "features": EPOCH_1_FEATURES
+        "namespace_prices_stacks": None,
+        "namespace_price_units": "BTC",
+        "features": EPOCH_1_FEATURES,
+        'script_types': ['nulldata', 'p2pkh', 'p2sh'],
+        'sender_types': ['p2pkh', 'p2sh'],
     },
     {
         # epoch 2
@@ -309,12 +473,18 @@ EPOCHS = [
                 "NAMESPACE_LIFETIME_MULTIPLIER": EPOCH_2_NAMESPACE_LIFETIME_MULTIPLIER_id,
                 "NAMESPACE_LIFETIME_GRACE_PERIOD": EPOCH_2_NAMESPACE_LIFETIME_GRACE_PERIOD_id,
                 "PRICE_MULTIPLIER": EPOCH_2_PRICE_MULTIPLIER_id,
+                "PRICE_MULTIPLIER_STACKS": EPOCH_2_PRICE_MULTIPLIER_STACKS,
+                "PRICE_DIVISOR": None,
+                "PRICE_DIVISOR_STACKS": None,
                 "NAMESPACE_RECEIVE_FEES_PERIOD": EPOCH_2_NAMESPACE_RECEIVE_FEES_PERIOD_id,
             },
             "*": {
                 "NAMESPACE_LIFETIME_MULTIPLIER": EPOCH_2_NAMESPACE_LIFETIME_MULTIPLIER_id,
                 "NAMESPACE_LIFETIME_GRACE_PERIOD": EPOCH_2_NAMESPACE_LIFETIME_GRACE_PERIOD_id,
                 "PRICE_MULTIPLIER": EPOCH_2_PRICE_MULTIPLIER_id,
+                "PRICE_MULTIPLIER_STACKS": EPOCH_2_PRICE_MULTIPLIER_STACKS,
+                "PRICE_DIVISOR": None,
+                "PRICE_DIVISOR_STACKS": None,
                 "NAMESPACE_RECEIVE_FEES_PERIOD": EPOCH_2_NAMESPACE_RECEIVE_FEES_PERIOD_id,
             },
         },
@@ -340,7 +510,11 @@ EPOCHS = [
             NAMESPACE_8UP_CHAR_COST,    # 18-character cost
             NAMESPACE_8UP_CHAR_COST,    # 19-character cost 
         ],
+        "namespace_prices_stacks": None,
+        "namespace_price_units": "BTC",
         "features": EPOCH_2_FEATURES,
+        'script_types': ['nulldata', 'p2pkh', 'p2sh'],
+        'sender_types': ['p2pkh', 'p2sh'],
     },
     {
         # epoch 3
@@ -350,12 +524,18 @@ EPOCHS = [
                 "NAMESPACE_LIFETIME_MULTIPLIER": EPOCH_3_NAMESPACE_LIFETIME_MULTIPLIER_id,
                 "NAMESPACE_LIFETIME_GRACE_PERIOD": EPOCH_3_NAMESPACE_LIFETIME_GRACE_PERIOD_id,
                 "PRICE_MULTIPLIER": EPOCH_3_PRICE_MULTIPLIER_id,
+                "PRICE_MULTIPLIER_STACKS": EPOCH_3_PRICE_MULTIPLIER_STACKS,
+                "PRICE_DIVISOR": None,
+                "PRICE_DIVISOR_STACKS": None,
                 "NAMESPACE_RECEIVE_FEES_PERIOD": EPOCH_3_NAMESPACE_RECEIVE_FEES_PERIOD_id,
             },
             "*": {
                 "NAMESPACE_LIFETIME_MULTIPLIER": EPOCH_3_NAMESPACE_LIFETIME_MULTIPLIER_id,
                 "NAMESPACE_LIFETIME_GRACE_PERIOD": EPOCH_3_NAMESPACE_LIFETIME_GRACE_PERIOD_id,
                 "PRICE_MULTIPLIER": EPOCH_3_PRICE_MULTIPLIER_id,
+                "PRICE_MULTIPLIER_STACKS": EPOCH_3_PRICE_MULTIPLIER_STACKS,
+                "PRICE_DIVISOR": None,
+                "PRICE_DIVISOR_STACKS": None,
                 "NAMESPACE_RECEIVE_FEES_PERIOD": EPOCH_3_NAMESPACE_RECEIVE_FEES_PERIOD_id,
             },
         },
@@ -381,7 +561,62 @@ EPOCHS = [
             NAMESPACE_8UP_CHAR_COST / 10,    # 18-character cost
             NAMESPACE_8UP_CHAR_COST / 10,    # 19-character cost 
         ],
+        "namespace_prices_stacks": None,
+        "namespace_price_units": "BTC",
         "features": EPOCH_3_FEATURES,
+        'script_types': ['nulldata', 'p2pkh', 'p2sh', 'p2sh-p2wpkh', 'p2sh-p2wsh'],
+        'sender_types': ['p2pkh', 'p2sh'],
+    },
+    {
+        # epoch 4
+        "end_block": EPOCH_4_END_BLOCK,
+        "namespaces": {
+            "id": {
+                "NAMESPACE_LIFETIME_MULTIPLIER": EPOCH_4_NAMESPACE_LIFETIME_MULTIPLIER_id,
+                "NAMESPACE_LIFETIME_GRACE_PERIOD": EPOCH_4_NAMESPACE_LIFETIME_GRACE_PERIOD_id,
+                "PRICE_MULTIPLIER": None,
+                "PRICE_MULTIPLIER_STACKS": None,
+                "PRICE_DIVISOR": EPOCH_4_PRICE_DIVISOR_id,
+                "PRICE_DIVISOR_STACKS": EPOCH_4_PRICE_DIVISOR_STACKS,
+                "NAMESPACE_RECEIVE_FEES_PERIOD": EPOCH_4_NAMESPACE_RECEIVE_FEES_PERIOD_id,
+            },
+            "*": {
+                "NAMESPACE_LIFETIME_MULTIPLIER": EPOCH_4_NAMESPACE_LIFETIME_MULTIPLIER_id,
+                "NAMESPACE_LIFETIME_GRACE_PERIOD": EPOCH_4_NAMESPACE_LIFETIME_GRACE_PERIOD_id,
+                "PRICE_MULTIPLIER": None,
+                "PRICE_MULTIPLIER_STACKS": None,
+                "PRICE_DIVISOR": EPOCH_4_PRICE_DIVISOR_id,
+                "PRICE_DIVISOR_STACKS": EPOCH_4_PRICE_DIVISOR_STACKS,
+                "NAMESPACE_RECEIVE_FEES_PERIOD": EPOCH_4_NAMESPACE_RECEIVE_FEES_PERIOD_id,
+            },
+        },
+        "namespace_prices": None,
+        "namespace_prices_stacks": [
+            None,
+            NAMESPACE_1_CHAR_COST_STACKS,
+            NAMESPACE_23_CHAR_COST_STACKS,
+            NAMESPACE_23_CHAR_COST_STACKS,
+            NAMESPACE_4567_CHAR_COST_STACKS,
+            NAMESPACE_4567_CHAR_COST_STACKS,
+            NAMESPACE_4567_CHAR_COST_STACKS,
+            NAMESPACE_4567_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+            NAMESPACE_8UP_CHAR_COST_STACKS,
+        ],
+        "namespace_price_units": "STACKS",
+        "features": EPOCH_4_FEATURES,
+        'script_types': ['nulldata', 'p2pkh', 'p2sh', 'p2sh-p2wpkh', 'p2sh-p2wsh'],
+        'sender_types': ['p2pkh', 'p2sh'],
     },
 ]
 
@@ -421,6 +656,32 @@ del nsid
 """
 
 MAGIC_BYTES = 'id'
+BLOCKSTACK_TESTNET_ID = None
+BLOCKSTACK_TESTNET_ACTIVE = False
+if os.environ.get('BLOCKSTACK_TESTNET_ID'):
+    assert len(os.environ['BLOCKSTACK_TESTNET_ID']) == 2, 'Invalid testnet ID "{}": must have exactly 2 characters'.format(os.environ['BLOCKSTACK_TESTNET_ID'])
+    assert os.environ['BLOCKSTACK_TESTNET_ID'] != MAGIC_BYTES, 'Invalid testnet ID "{}": must *not* equal "{}"'.format(os.environ['BLOCKSTACK_TESTNET_ID'], MAGIC_BYTES)
+
+    MAGIC_BYTES = os.environ['BLOCKSTACK_TESTNET_ID']
+    BLOCKSTACK_TESTNET_ID = MAGIC_BYTES
+    BLOCKSTACK_TESTNET_ACTIVE = True
+
+    if not os.environ.get('BLOCKSTACK_API_PORT'):
+        # new default
+        DEFAULT_API_PORT = 16268
+
+    if not BLOCKSTACK_TEST:
+        # new default
+        RPC_SERVER_PORT = RPC_SERVER_TEST_PORT
+
+    print >> sys.stderr, 'Overriding magic byte sequence to "{}"'.format(MAGIC_BYTES)
+
+def blockstack_magic_bytes():
+    return MAGIC_BYTES
+
+def set_blockstack_magic_bytes(b):
+    assert len(b) == 2, 'Invalid magic bytes'
+    MAGIC_BYTES = b
 
 """ name operation data configs
 """
@@ -439,6 +700,8 @@ NAMESPACE_REVEAL = '&'
 NAMESPACE_READY = '!'
 ANNOUNCE = '#'
 
+TOKEN_TRANSFER = '$'
+
 # extra bytes affecting a transfer
 TRANSFER_KEEP_DATA = '>'
 TRANSFER_REMOVE_DATA = '~'
@@ -456,7 +719,8 @@ OPCODES = [
    NAMESPACE_PREORDER,
    NAMESPACE_REVEAL,
    NAMESPACE_READY,
-   ANNOUNCE
+   ANNOUNCE,
+   TOKEN_TRANSFER,
 ]
 
 OPCODE_NAMES = {
@@ -470,7 +734,8 @@ OPCODE_NAMES = {
     NAMESPACE_PREORDER: "NAMESPACE_PREORDER",
     NAMESPACE_REVEAL: "NAMESPACE_REVEAL",
     NAMESPACE_READY: "NAMESPACE_READY",
-    ANNOUNCE: "ANNOUNCE"
+    ANNOUNCE: "ANNOUNCE",
+    TOKEN_TRANSFER: "TOKEN_TRANSFER",
 }
 
 NAME_OPCODES = {
@@ -484,7 +749,8 @@ NAME_OPCODES = {
     "NAMESPACE_PREORDER": NAMESPACE_PREORDER,
     "NAMESPACE_REVEAL": NAMESPACE_REVEAL,
     "NAMESPACE_READY": NAMESPACE_READY,
-    "ANNOUNCE": ANNOUNCE
+    "ANNOUNCE": ANNOUNCE,
+    "TOKEN_TRANSFER": TOKEN_TRANSFER,
 }
 
 
@@ -512,7 +778,8 @@ LENGTHS = {
     'blockchain_id_namespace_id': 19,
     'namespace_id': 19,     # same as above
     'announce': 20,
-    'max_op_length': 80
+    'max_op_length': 80,
+    'tokens_burnt': 8,
 }
 
 MIN_OP_LENGTHS = {
@@ -593,13 +860,6 @@ OPCODE_NAMESPACE_STATE_TRANSITIONS = [
 
 OPCODE_TRANSITION_OPS = OPCODE_NAME_STATE_TRANSITIONS + OPCODE_NAMESPACE_STATE_TRANSITIONS 
 
-# set of operations that have fees 
-OPCODE_HAVE_FEES = [
-    "NAMESPACE_PREORDER",
-    "NAME_PREORDER",
-    "NAME_RENEWAL"
-]
-
 # set of ops that have no state to record 
 OPCODE_STATELESS_OPS = [
     "ANNOUNCE"
@@ -614,6 +874,11 @@ OPCODE_NAME_NAMEOPS = [
     'NAME_TRANSFER',
     'NAME_RENEWAL',
     'NAME_REVOKE'
+]
+
+# set of token operations 
+OPCODE_TOKEN_OPS = [
+    "TOKEN_TRANSFER",
 ]
 
 NAMESPACE_LIFE_INFINITE = 0xffffffff
@@ -653,8 +918,12 @@ if BLOCKSTACK_TESTNET:
 
 SUBDOMAIN_ADDRESS_VERSION_BYTES = [SUBDOMAIN_ADDRESS_VERSION_BYTE, SUBDOMAIN_ADDRESS_MULTISIG_VERSION_BYTE]
 
+# built-in token types
+TOKEN_TYPE_STACKS = "STACKS"
+
 # global mutable state 
 blockstack_opts = None
+blockstack_api_opts = None
 bitcoin_opts = None
 running = False
 
@@ -713,15 +982,70 @@ def get_epoch_namespace_lifetime_grace_period( block_height, namespace_id ):
         return epoch_config['namespaces']['*']['NAMESPACE_LIFETIME_GRACE_PERIOD']
 
 
-def get_epoch_price_multiplier( block_height, namespace_id ):
+def get_epoch_price_multiplier( block_height, namespace_id, units ):
     """
     what's the name price multiplier for this epoch?
+    Not all epochs have one---if this epoch has BLOCKSTACK_INT_DIVISION set, use
+    get_epoch_price_divisor() instead.
     """
+    try:
+        assert units in [TOKEN_TYPE_STACKS, 'BTC'], 'Unknown units {}'.format(units)
+    except AssertionError as ae:
+        log.exception(ae)
+        log.error("FATAL: No such units {}".format(units))
+        os.abort()
+
+    multiplier = 'PRICE_MULTIPLIER' if units == 'BTC' else 'PRICE_MULTIPLIER_STACKS'
+
     epoch_config = get_epoch_config( block_height )
+    m = None
+
     if epoch_config['namespaces'].has_key(namespace_id):
-        return epoch_config['namespaces'][namespace_id]['PRICE_MULTIPLIER']
+        m = epoch_config['namespaces'][namespace_id][multiplier]
     else:
-        return epoch_config['namespaces']['*']['PRICE_MULTIPLIER']
+        m = epoch_config['namespaces']['*'][multiplier]
+
+    try:
+        assert m is not None
+    except AssertionError as ae:
+        log.exception(ae)
+        log.error("FATAL: Tried to get a price multiplier in an epoch without price multipliers!")
+        os.abort()
+
+    return m
+
+
+def get_epoch_price_divisor( block_height, namespace_id, units ):
+    """
+    what's the name price divisor for this epoch?
+    Not all epochs have one---if this epoch does NOT have BLOCKSTACK_INT_DIVISION set,
+    use get_epoch_price_multiplier() instead.
+    """
+    try:
+        assert units in [TOKEN_TYPE_STACKS, 'BTC'], 'Unknown units {}'.format(units)
+    except AssertionError as ae:
+        log.exception(ae)
+        log.error("FATAL: No such units {}".format(units))
+        os.abort()
+
+    divisor = 'PRICE_DIVISOR' if units == 'BTC' else 'PRICE_DIVISOR_STACKS'
+
+    epoch_config = get_epoch_config( block_height )
+    d = None
+
+    if epoch_config['namespaces'].has_key(namespace_id):
+        d = epoch_config['namespaces'][namespace_id][divisor]
+    else:
+        d = epoch_config['namespaces']['*'][divisor]
+
+    try:
+        assert d is not None
+    except AssertionError as ae:
+        log.exception(ae)
+        log.error("FATAL: Tried to get a price divisor in an epoch without price divisors!")
+        os.abort()
+
+    return d
 
 
 def get_epoch_namespace_receive_fees_period( block_height, namespace_id ):
@@ -735,12 +1059,42 @@ def get_epoch_namespace_receive_fees_period( block_height, namespace_id ):
         return epoch_config['namespaces']['*']['NAMESPACE_RECEIVE_FEES_PERIOD']
 
 
-def get_epoch_namespace_prices( block_height ):
+def get_epoch_namespace_prices( block_height, units ):
     """
     get the list of namespace prices by block height
     """
+    assert units in ['BTC', TOKEN_TYPE_STACKS], 'Invalid unit {}'.format(units)
+
     epoch_config = get_epoch_config( block_height )
-    return epoch_config['namespace_prices']
+
+    if units == 'BTC':
+        return epoch_config['namespace_prices']
+    else:
+        return epoch_config['namespace_prices_stacks']
+
+
+def get_epoch_namespace_price_units(block_height):
+    """
+    Get the units to use to pay for namespaces in this epoch
+    """
+    epoch_config = get_epoch_config(block_height)
+    return epoch_config['namespace_price_units']
+
+
+def get_epoch_btc_script_types(block_height):
+    """
+    What kind of output scripts do we allow in this epoch?
+    """
+    epoch_config = get_epoch_config(block_height)
+    return epoch_config['script_types']
+
+
+def get_epoch_btc_sender_types(block_height):
+    """
+    What kind of sender output scripts do we allow in this epoch?
+    """
+    epoch_config = get_epoch_config(block_height)
+    return epoch_config['sender_types']
 
 
 def get_epoch_features( block_height ):
@@ -823,7 +1177,6 @@ def get_bitcoin_opts():
    """
    Get the bitcoind connection arguments.
    """
-
    global bitcoin_opts
    return bitcoin_opts
 
@@ -834,6 +1187,14 @@ def get_blockstack_opts():
    """
    global blockstack_opts
    return blockstack_opts
+
+
+def get_blockstack_api_opts():
+    """
+    Get the blockstack RESTful API configuration options
+    """
+    global blockstack_api_opts
+    return blockstack_api_opts
 
 
 def set_bitcoin_opts( new_bitcoin_opts ):
@@ -850,6 +1211,14 @@ def set_blockstack_opts( new_opts ):
     """
     global blockstack_opts
     blockstack_opts = new_opts
+
+
+def set_blockstack_api_opts( new_opts ):
+    """
+    Set new RESTful API opts
+    """
+    global blockstack_api_opts
+    blockstack_api_opts = new_opts
 
 
 def get_indexing_lockfile(working_dir):
@@ -905,6 +1274,54 @@ def is_running():
     """
     global running 
     return running
+
+
+def get_recovery_range(working_dir):
+    """
+    Get the range of blocks for which we are reprocessing
+    transactions on recovery.
+    Returns (start_block, end_block) tu↵ple, which will be
+    (None, None) if we're not recovering
+    """
+    recovery_range_path = os.path.join(working_dir, '.recovery')
+    if not os.path.exists(recovery_range_path):
+        return (None, None)
+
+    with open(recovery_range_path) as f:
+        data = f.read()
+
+    lines = filter(lambda l: len(l) > 0, map(lambda l2: l2.strip(), data.split()))
+    assert len(lines) == 2, 'Invalid .recovery file'
+    try:
+        start_block = int(lines[0])
+        end_block = int(lines[1])
+    except:
+        raise ValueError('Failed to parse {}'.format(recovery_range_path))
+
+    return (start_block, end_block)
+
+
+def set_recovery_range(working_dir, start_block, end_block):
+    """
+    Set the recovery block range if we're restoring and reporcessing
+    transactions from a backup.
+
+    Writes the recovery range to the working directory if the working directory is given and persist is True
+    """
+    recovery_range_path = os.path.join(working_dir, '.recovery')
+    with open(recovery_range_path, 'w') as f:
+        f.write('{}\n{}\n'.format(start_block, end_block))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def clear_recovery_range(working_dir):
+    """
+    Clear out our recovery hint
+    """
+    recovery_range_path = os.path.join(working_dir, '.recovery')
+    if os.path.exists(recovery_range_path):
+        os.unlink(recovery_range_path)
 
 
 def is_atlas_enabled(blockstack_opts):
@@ -968,7 +1385,7 @@ def store_announcement( working_dir, announcement_hash, announcement_text, force
        failed_path = announce_filename_tmp + (".%s" % i)
        while os.path.exists( failed_path ):
 
-           log.debug("Merge announcement list %s" % failed_paht )
+           log.debug("Merge announcement list %s" % failed_path )
            with open(failed_path, "r") as f:
                announce_text += f.read()
 
@@ -998,9 +1415,9 @@ def store_announcement( working_dir, announcement_hash, announcement_text, force
        f.flush()
 
    # NOTE: rename doesn't remove the old file on Windows
-   if sys.platform == 'win32' and os.path.exists( announcement_filename_tmp ):
+   if sys.platform == 'win32' and os.path.exists( announce_filename_tmp ):
        try:
-           os.unlink( announcement_filename_tmp )
+           os.unlink( announce_filename_tmp )
        except:
            pass
 
@@ -1039,13 +1456,46 @@ def store_announcement( working_dir, announcement_hash, announcement_text, force
    log.debug("Stored announcement to %s" % (announcement_text_path))
 
 
+def get_atlas_hostname_stun():
+    log.debug("Using STUN servers to discover my public IP (set 'atlas_hostname' to a valid DNS name or IP address in the config file to override)")
+    _, real_atlas_hostname, _ = stun.get_ip_info()
+    log.debug("Atlas host IP is {}".format(real_atlas_hostname))
+    return real_atlas_hostname
+
+
+def get_atlas_hostname_addrinfo(rpc_port):
+    log.debug("Using getnameinfo and getaddrinfo to get my assigned IP address (set 'atlas_hostname' to a valid DNS name or IP address in the config to override)")
+    hostn = socket.gethostname()
+
+    try:
+        addr_infos = socket.getaddrinfo(hostn, rpc_port)
+    except socket.gaierror as gaie:
+        # hostname doesn't match /etc/hosts, or similar (can happen in chroots)
+        log.warning('Unable to get addr info for {}: {}.  Defaulting to 127.0.0.1'.format(hostn, gaie))
+        return '127.0.0.1'
+        
+    real_atlas_hostname = None
+    for addr_info in addr_infos:
+        # addr_info[0] == ai_family
+        # addr_info[1] == ai_socktype
+        # addr_info[2] == ai_protocol
+        # addr_info[3] == ai_cannonname
+        # addr_info[4] == (hostname, port) (ai_sockaddr)
+        if addr_info[0] in (socket.AF_INET, socket.AF_INET6) and addr_info[1] == socket.SOCK_STREAM and addr_info[2] == socket.IPPROTO_TCP:
+            # tcp/ip, either IPv4 or IPv6
+            real_atlas_hostname = addr_info[4][0]
+
+    log.debug("Atlas host IP is {}".format(real_atlas_hostname))
+    return real_atlas_hostname
+
+
 def default_blockstack_opts( working_dir, config_file=None ):
    """
    Get our default blockstack opts from a config file
    or from sane defaults.
    """
 
-   global RPC_SERVER_IP
+   global RPC_SERVER_IP, RPC_SERVER_PORT
 
    from .util import url_to_host_port
    from .scripts import is_name_valid
@@ -1065,16 +1515,20 @@ def default_blockstack_opts( working_dir, config_file=None ):
    backup_max_age = 1008    # one week
    rpc_port = RPC_SERVER_PORT 
    zonefile_dir = os.path.join( os.path.dirname(config_file), "zonefiles")
-   server_version = None
+   server_version = VERSION
    atlas_enabled = True
-   atlas_seed_peers = "node.blockstack.org:%s" % RPC_SERVER_PORT
+   atlas_seed_peers = "node.blockstack.org:%s" % RPC_SERVER_PORT if not BLOCKSTACK_TESTNET_ACTIVE else ""
    atlasdb_path = os.path.join( os.path.dirname(config_file), "atlas.db" )
    atlas_blacklist = ""
    atlas_hostname = RPC_SERVER_IP
+   real_atlas_hostname = None       # if we need to look it up on-the-fly
    atlas_port = RPC_SERVER_PORT
    subdomaindb_path = os.path.join( os.path.dirname(config_file), "subdomains.db" )
+   run_indexer = True
 
    if parser.has_section('blockstack'):
+      if parser.has_option('blockstack', 'enabled'):
+         run_indexer = parser.get('blockstack', 'enabled').lower() in ['1', 'true', 'on']
 
       if parser.has_option('blockstack', 'backup_frequency'):
          backup_frequency = int( parser.get('blockstack', 'backup_frequency'))
@@ -1115,12 +1569,9 @@ def default_blockstack_opts( working_dir, config_file=None ):
 
       if parser.has_option('blockstack', 'atlas_seeds'):
          atlas_seed_peers = parser.get('blockstack', 'atlas_seeds')
-         
+
          # must be a CSV of host:port
-         hostports = filter( lambda x: len(x) > 0, atlas_seed_peers.split(",") )
-         for hp in hostports:
-             host, port = url_to_host_port( hp )
-             assert host is not None and port is not None
+         check_hostport_list(atlas_seed_peers)
 
       if parser.has_option('blockstack', 'atlasdb_path'):
          atlasdb_path = parser.get('blockstack', 'atlasdb_path')
@@ -1143,6 +1594,12 @@ def default_blockstack_opts( working_dir, config_file=None ):
       if parser.has_option('blockstack', 'subdomaindb_path'):
          subdomaindb_path = parser.get('blockstack', 'subdomaindb_path')
 
+   if os.environ.get(ATLAS_SEEDS_ENV_VAR, False):
+       atlas_seed_peers = os.environ[ATLAS_SEEDS_ENV_VAR]
+       check_hostport_list(atlas_seed_peers)
+
+   if os.environ.get(ATLAS_HOSTNAME_ENV_VAR, False):
+       atlas_hostname = os.environ[ATLAS_HOSTNAME_ENV_VAR]
 
    if os.path.exists( announce_path ):
        # load announcement list
@@ -1165,12 +1622,33 @@ def default_blockstack_opts( working_dir, config_file=None ):
        except:
            pass
 
-   if atlas_hostname is None:
-       log.debug("Using STUN servers to discover my public IP (set 'atlas_hostname' in the config file to skip this step)")
-       _, atlas_hostname, _ = stun.get_ip_info()
-       log.debug("Atlas host IP is {}".format(atlas_hostname))
+   if RPC_SERVER_IP is None:
+       if atlas_hostname is None or atlas_hostname.lower() == '<stun>':
+           real_atlas_hostname = get_atlas_hostname_stun()
+           RPC_SERVER_IP = real_atlas_hostname
 
-   RPC_SERVER_IP = atlas_hostname
+       elif atlas_hostname.lower() == '<host>':
+           real_atlas_hostname = get_atlas_hostname_addrinfo(rpc_port)
+           RPC_SERVER_IP = real_atlas_hostname
+       
+       else:
+           log.debug('Using configuration-given Atlas hostname')
+           real_atlas_hostname = atlas_hostname
+           RPC_SERVER_IP = atlas_hostname
+
+       if atlas_hostname is None and real_atlas_hostname is None:
+           log.warning('No Atlas hostname could be determined, assuming 127.0.0.1')
+           real_atlas_hostname = '127.0.0.1'
+           RPC_SERVER_IP = real_atlas_hostname
+   
+       log.info('Atlas IP address is ({}, {})'.format(RPC_SERVER_IP, rpc_port))
+
+   else:
+       # already set
+       real_atlas_hostname = RPC_SERVER_IP
+
+   atlas_hostname = real_atlas_hostname
+   RPC_SERVER_PORT = rpc_port
 
    blockstack_opts = {
        'rpc_port': rpc_port,
@@ -1187,6 +1665,7 @@ def default_blockstack_opts( working_dir, config_file=None ):
        'atlas_port': atlas_port,
        'zonefiles': zonefile_dir,
        'subdomaindb_path': subdomaindb_path,
+       'enabled': run_indexer
    }
 
    # strip Nones
@@ -1195,6 +1674,63 @@ def default_blockstack_opts( working_dir, config_file=None ):
          del blockstack_opts[k]
 
    return blockstack_opts
+
+
+def default_blockstack_api_opts(working_dir, config_file=None):
+   """
+   Get our default blockstack RESTful API opts from a config file,
+   or from sane defaults.
+   """
+
+   from .util import url_to_host_port, url_protocol
+
+   if config_file is None:
+      config_file = virtualchain.get_config_filename(get_default_virtualchain_impl(), working_dir)
+
+   parser = SafeConfigParser()
+   parser.read(config_file)
+
+   blockstack_api_opts = {}
+   indexer_url = None
+   api_port = DEFAULT_API_PORT
+   api_host = DEFAULT_API_HOST
+   run_api = True
+
+   if parser.has_section('blockstack-api'):
+      if parser.has_option('blockstack-api', 'enabled'):
+          run_api = parser.get('blockstack-api', 'enabled').lower() in ['true', '1', 'on']
+
+      if parser.has_option('blockstack-api', 'api_port'):
+          api_port = int(parser.get('blockstack-api', 'api_port'))
+
+      if parser.has_option('blockstack-api', 'api_host'):
+          api_host = parser.get('blockstack-api', 'api_host')
+
+      if parser.has_option('blockstack-api', 'indexer_url'):
+          indexer_host, indexer_port = url_to_host_port(parser.get('blockstack-api', 'indexer_url'))
+          indexer_protocol = url_protocol(parser.get('blockstack-api', 'indexer_url'))
+          if indexer_protocol is None:
+              indexer_protocol = 'http'
+
+          indexer_url = parser.get('blockstack-api', 'indexer_url')
+
+   if indexer_url is None:
+       # try defaults
+       indexer_url = 'http://localhost:{}'.format(RPC_SERVER_PORT)
+
+   blockstack_api_opts = {
+        'indexer_url': indexer_url,
+        'api_host': api_host,
+        'api_port': api_port,
+        'enabled': run_api
+   }
+
+   # strip Nones
+   for (k, v) in blockstack_api_opts.items():
+      if v is None:
+         del blockstack_api_opts[k]
+
+   return blockstack_api_opts
 
 
 def interactive_prompt(message, parameters, default_opts):
@@ -1285,6 +1821,12 @@ def opt_strip(prefix, opts):
 
     return ret
 
+def check_hostport_list(hp_list):
+    from .util import url_to_host_port
+    hostports = filter( lambda x: len(x) > 0, hp_list.split(",") )
+    for hp in hostports:
+        host, port = url_to_host_port( hp )
+        assert host is not None and port is not None
 
 def opt_restore(prefix, opts):
     """
@@ -1312,7 +1854,15 @@ def default_bitcoind_opts(config_file=None, prefix=False):
     return default_bitcoin_opts
 
 
-def configure( working_dir, config_file=None, force=False, interactive=True ):
+def default_working_dir():
+    """
+    Get the default configuration directory for blockstackd
+    """
+    import nameset.virtualchain_hooks as virtualchain_hooks
+    return os.path.expanduser('~/.{}'.format(virtualchain_hooks.get_virtual_chain_name()))
+
+
+def configure(working_dir, config_file=None, force=False, interactive=False):
    """
    Configure blockstack:  find and store configuration parameters to the config file.
 
@@ -1321,15 +1871,12 @@ def configure( working_dir, config_file=None, force=False, interactive=True ):
 
    Optionally force a re-prompting for all configuration details (with force=True)
 
-   Return {'blockstack': {...}, 'bitcoind': {...}}
+   Return {'blockstack': {...}, 'bitcoind': {...}, 'blockstack-api': {...}}
    """
 
    if config_file is None:
-      try:
-         # get input for everything
-         config_file = virtualchain.get_config_filename(get_default_virtualchain_impl(), working_dir)
-      except:
-         raise
+      # get input for everything
+      config_file = virtualchain.get_config_filename(get_default_virtualchain_impl(), working_dir)
 
    if not os.path.exists( config_file ):
        # definitely ask for everything
@@ -1339,22 +1886,36 @@ def configure( working_dir, config_file=None, force=False, interactive=True ):
 
    # get blockstack opts
    blockstack_opts = {}
-   blockstack_opts_defaults = default_blockstack_opts(working_dir, config_file=config_file )
+   blockstack_opts_defaults = default_blockstack_opts(working_dir, config_file=config_file)
    blockstack_params = blockstack_opts_defaults.keys()
 
-   if not force:
-
+   if not force or not interactive:
        # default blockstack options
        blockstack_opts = default_blockstack_opts(working_dir, config_file=config_file )
 
-   blockstack_msg = "ADVANCED USERS ONLY.\nPlease enter blockstack configuration hints."
+   blockstack_msg = "Please enter blockstack configuration hints."
 
-   # NOTE: disabled
    blockstack_opts, missing_blockstack_opts, num_blockstack_opts_prompted = find_missing( blockstack_msg, \
                                                                                           blockstack_params, \
                                                                                           blockstack_opts, \
                                                                                           blockstack_opts_defaults, \
-                                                                                          prompt_missing=False )
+                                                                                          prompt_missing=interactive )
+
+   blockstack_api_opts = {}
+   blockstack_api_defaults = default_blockstack_api_opts(working_dir, config_file=config_file)
+   blockstack_api_params = blockstack_api_defaults.keys()
+   
+   if not force or not interactive:
+       # default blockstack API options
+       blockstack_api_opts = default_blockstack_api_opts(working_dir, config_file=config_file)
+
+   blockstack_api_msg = "Please enter blockstack RESTful API configuration hints."
+
+   blockstack_api_opts, missing_blockstack_api_opts, num_blockstack_api_opts_prompted = find_missing( blockstack_api_msg, \
+                                                                                                      blockstack_api_params, \
+                                                                                                      blockstack_api_opts, \
+                                                                                                      blockstack_api_defaults, \
+                                                                                                      prompt_missing=interactive )
 
    bitcoind_message  = "Blockstack does not have enough information to connect\n"
    bitcoind_message += "to bitcoind.  Please supply the following parameters, or\n"
@@ -1364,8 +1925,7 @@ def configure( working_dir, config_file=None, force=False, interactive=True ):
    bitcoind_opts_defaults = default_bitcoind_opts( config_file=config_file )
    bitcoind_params = bitcoind_opts_defaults.keys()
 
-   if not force:
-
+   if not force or not interactive:
       # get default set of bitcoind opts
       bitcoind_opts = default_bitcoind_opts( config_file=config_file )
 
@@ -1377,17 +1937,19 @@ def configure( working_dir, config_file=None, force=False, interactive=True ):
                                                                               bitcoind_opts_defaults, \
                                                                               prompt_missing=interactive )
 
-   if not interactive and (len(missing_bitcoin_opts) > 0 or len(missing_blockstack_opts) > 0):
+   if not interactive and (len(missing_bitcoin_opts) > 0 or len(missing_blockstack_opts) > 0 or len(missing_blockstack_api_opts) > 0):
        # cannot continue
-       raise Exception("Missing configuration fields: %s" % (",".join( missing_blockstack_opts + missing_bitcoin_opts )) )
+       raise Exception("Missing configuration fields: %s" % (",".join( missing_blockstack_opts + missing_bitcoin_opts + missing_blockstack_api_opts )) )
 
    ret = {
       'blockstack': blockstack_opts,
-      'bitcoind': bitcoind_opts
+      'bitcoind': bitcoind_opts,
+      'blockstack-api': blockstack_api_opts
    }
 
    # if we prompted, then save
-   if num_bitcoind_prompted > 0 or num_blockstack_opts_prompted > 0:
+   if num_bitcoind_prompted > 0 or num_blockstack_opts_prompted > 0 or num_blockstack_api_opts_prompted > 0 or \
+      (not os.path.exists(config_file) and not interactive):
        print >> sys.stderr, "Saving configuration to %s" % config_file
    
        # always set version when writing
@@ -1395,10 +1957,14 @@ def configure( working_dir, config_file=None, force=False, interactive=True ):
        if not config_opts['blockstack'].has_key('server_version'):
            config_opts['blockstack']['server_version'] = VERSION
 
+       if not config_opts['blockstack-api'].has_key('server_version'):
+           config_opts['blockstack']['server_version'] = VERSION
+
        # if the config file doesn't exist, then set the version 
        # in ret as well, since it's what's written
        if not os.path.exists(config_file):
            ret['blockstack']['server_version'] = VERSION
+           ret['blockstack-api']['server_version'] = VERSION
 
        write_config_file( config_opts, config_file )
 
@@ -1470,6 +2036,23 @@ def semver_newer(v1, v2):
     return True
 
 
+def semver_equal(v1, v2):
+    """
+    Verify (as semantic versions) if v1 == v2
+    Patch versions can be different
+    """
+    v1_parts = v1.split('.')
+    v2_parts = v2.split('.')
+    if len(v1_parts) < 3 or len(v2_parts) < 3:
+        # one isn't a semantic version
+        return False
+
+    v1_major, v1_minor, v1_patch = get_version_parts(v1_parts, int)
+    v2_major, v2_minor, v2_patch = get_version_parts(v2_parts, int)
+
+    return v1_major == v2_major and v1_minor == v2_minor
+
+
 def versions_need_upgrade(v_from, v_to):
     version_upgrades = [
         # all semver mismatches before "0.17" require upgrade
@@ -1487,4 +2070,38 @@ def versions_need_upgrade(v_from, v_to):
         if version_needs_upgrade_check(v1):
             return True
     return False
+
+
+def load_configuration(working_dir):
+    """
+    Load the system configuration and set global variables
+    Return the configuration of the node on success.
+    Return None on failure
+    """
+
+    import nameset.virtualchain_hooks as virtualchain_hooks
+
+    # acquire configuration, and store it globally
+    opts = configure(working_dir)
+    blockstack_opts = opts.get('blockstack', None)
+    blockstack_api_opts = opts.get('blockstack-api', None)
+    bitcoin_opts = opts['bitcoind']
+
+    # config file version check
+    config_server_version = blockstack_opts.get('server_version', None)
+    if (config_server_version is None or versions_need_upgrade(config_server_version, VERSION)):
+       print >> sys.stderr, "Obsolete or unrecognizable config file ({}): '{}' != '{}'".format(virtualchain.get_config_filename(virtualchain_hooks, working_dir), config_server_version, VERSION)
+       print >> sys.stderr, 'Please see the release notes for version {} for instructions to upgrade (in the release-notes/ folder).'.format(VERSION)
+       return None
+
+    # store options
+    set_bitcoin_opts( bitcoin_opts )
+    set_blockstack_opts( blockstack_opts )
+    set_blockstack_api_opts( blockstack_api_opts )
+
+    return {
+        'bitcoind': bitcoin_opts,
+        'blockstack': blockstack_opts,
+        'blockstack-api': blockstack_api_opts
+    }
 

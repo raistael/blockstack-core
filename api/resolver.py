@@ -35,17 +35,17 @@ from flask_crossdomain import crossdomain
 from time import time
 
 from blockstack_proofs import profile_to_proofs, profile_v3_to_proofs
+import blockstack_zones
 
-import blockstack_client.profile
-import blockstack_client.subdomains
-
-from blockstack_client.schemas import OP_NAME_PATTERN, OP_NAMESPACE_PATTERN
+import blockstack
+from blockstack.lib.schemas import OP_NAME_PATTERN, OP_NAMESPACE_PATTERN
 
 from api.utils import cache_control
 
 from .config import DEBUG
 from .config import DEFAULT_HOST, DEFAULT_CACHE_TIMEOUT
 from .config import NAMES_FILE
+from .config import BASE_INDEXER_API_URL
 
 import requests
 requests.packages.urllib3.disable_warnings()
@@ -59,6 +59,13 @@ if DEBUG:
     log.setLevel(level=logging.DEBUG)
 else:
     log.setLevel(level=logging.INFO)
+
+blockstack_indexer_url = BASE_INDEXER_API_URL
+
+if blockstack_indexer_url is None:
+    blockstack_working_dir = blockstack.lib.config.default_working_dir()
+    blockstack_config = blockstack.lib.load_configuration(blockstack_working_dir)
+    blockstack_indexer_url = blockstack_config['blockstack-api']['indexer_url']
 
 # copied and patched from proofs.py
 def site_data_to_fixed_proof_url(account, zonefile):
@@ -144,6 +151,14 @@ def format_profile(profile, fqa, zone_file, address, public_key):
         1) Insert verifications
         2) Check if profile data is valid JSON
     """
+    
+    # if the zone file is a string, then parse it 
+    if isinstance(zone_file, (str,unicode)):
+        try:
+            zone_file = blockstack_zones.parse_zone_file(zone_file)
+        except:
+            # leave as text
+            pass
 
     data = {'profile' : profile,
             'zone_file' : zone_file,
@@ -166,17 +181,6 @@ def format_profile(profile, fqa, zone_file, address, public_key):
 
     return data
 
-NAME_PATTERN = re.compile(OP_NAME_PATTERN)
-NS_PATTERN = re.compile(OP_NAMESPACE_PATTERN)
-def is_valid_fqa(fqa):
-    if (NAME_PATTERN.match(fqa) is None):
-        return False
-    try:
-        username, ns = fqa.split(".")
-    except:
-        return False
-    return (NS_PATTERN.match(ns) is not None)
-
 def get_profile(fqa):
     """ Given a fully-qualified username (username.namespace)
         get the data associated with that fqu.
@@ -186,35 +190,29 @@ def get_profile(fqa):
     profile_expired_grace = False
 
     fqa = fqa.lower()
-    if not is_valid_fqa(fqa):
-        fqa = str(fqa)
-        res = blockstack_client.subdomains.is_address_subdomain(fqa)
-        if res:
-            subdomain, domain = res[1]
-            try:
-                resp = blockstack_client.subdomains.resolve_subdomain(subdomain, domain)
-                data = { 'profile' : resp['profile'],
-                         'zone_file': resp['zonefile'],
-                         'public_key': resp.get('public_key', None),
-                         'verifications' : [] }
-                return data
-            except blockstack_client.subdomains.SubdomainNotFound as e:
-                log.exception(e)
-                abort(404, json.dumps({'error' : 'Name {} not found'.format(fqa)}))
-
-        return {'error' : 'Malformed name {}'.format(fqa)}
-
 
     try:
-        res = blockstack_client.profile.get_profile(
-            fqa, use_legacy = True, include_name_record = True)
+        try:
+            res = blockstack.lib.client.resolve_profile(
+                    fqa, include_name_record=True, hostport=blockstack_indexer_url)
+        except ValueError:
+            # invalid name 
+            res = {'error': 'Invalid name', 'status_code': 400}
+
         if 'error' in res:
             log.error('Error from profile.get_profile: {}'.format(res['error']))
             if "no user record hash defined" in res['error']:
                 res['status_code'] = 404
             if "Failed to load user profile" in res['error']:
                 res['status_code'] = 404
+
+            if res.get('http_status'):
+                # pass along 
+                res['status_code'] = res['http_status']
+                del res['http_status']
+
             return res
+
         log.warn(json.dumps(res['name_record']))
 
         profile = res['profile']
@@ -254,6 +252,7 @@ def get_users(username):
     """
     reply = {}
 
+    log.debug('Begin /v[x]/users/' + username)
 
     if username is None:
         reply['error'] = "No username given"
